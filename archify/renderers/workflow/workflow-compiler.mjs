@@ -4397,7 +4397,7 @@ ${renderLegend()}
       }),
       diagnostics: [],
     };
-    return { ok: true, svg, receipt };
+    return { ok: true, svg, receipt, resolvedQualityProfile };
   } catch (error) {
     if (!Array.isArray(error?.archifyDiagnostics)) throw error;
     const diagnostics = error.archifyDiagnostics.map((diagnostic) => ({ ...diagnostic }));

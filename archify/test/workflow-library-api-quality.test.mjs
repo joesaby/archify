@@ -39,6 +39,7 @@ test('renderWorkflow stays advisory regardless of an ambient ARCHIFY_QUALITY_PRO
   assert.equal(baseline.ok, true, JSON.stringify(baseline.diagnostics));
   assert.match(baseline.svg, /data-quality-gates="advisory"/);
   assert.match(baseline.svg, /data-quality-profile="standard"/);
+  assert.equal(baseline.meta.quality_profile, undefined);
 
   // A host process that happens to run with this env var set for unrelated
   // reasons (e.g. it also shells out to archify's own CLI elsewhere) must
@@ -49,6 +50,7 @@ test('renderWorkflow stays advisory regardless of an ambient ARCHIFY_QUALITY_PRO
   assert.equal(withAmbientEnv.svg, baseline.svg);
   assert.match(withAmbientEnv.svg, /data-quality-gates="advisory"/);
   assert.doesNotMatch(withAmbientEnv.svg, /data-quality-profile="showcase"/);
+  assert.equal(withAmbientEnv.meta.quality_profile, undefined);
 });
 
 test('renderWorkflow still honors an explicit qualityProfile argument under the same ambient env', async (t) => {
@@ -60,4 +62,8 @@ test('renderWorkflow still honors an explicit qualityProfile argument under the 
   assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
   assert.match(result.svg, /data-quality-profile="showcase"/);
   assert.doesNotMatch(result.svg, /data-quality-gates="advisory"/);
+  // meta must agree with what was actually rendered into the SVG, not the
+  // caller's authored (pre-override) value.
+  assert.equal(result.meta.quality_profile, 'showcase');
+  assert.equal(document.meta.quality_profile, undefined, 'caller input must stay untouched');
 });

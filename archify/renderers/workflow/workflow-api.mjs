@@ -64,14 +64,22 @@ async function renderWorkflowInternal({
     return { ok: false, error: compiled.error, diagnostics: compiled.diagnostics, receipt: compiled.receipt };
   }
 
+  // Report the effective profile, not just the authored one: an explicit
+  // qualityProfile argument is what actually got rendered into compiled.svg,
+  // so meta must agree with the SVG rather than silently disagreeing with it.
+  const { resolvedQualityProfile } = compiled;
+  const meta = resolvedQualityProfile && resolvedQualityProfile !== diagram.meta?.quality_profile
+    ? { ...diagram.meta, quality_profile: resolvedQualityProfile }
+    : diagram.meta;
+
   const html = renderDiagramHtml({
     diagramType: 'workflow',
-    meta: diagram.meta,
+    meta,
     svg: compiled.svg,
     cards: diagram.cards,
     sourceEvidence,
     template: readTemplate(),
   });
 
-  return { ok: true, html, svg: compiled.svg, cards: diagram.cards, meta: diagram.meta, sourceEvidence, receipt: compiled.receipt };
+  return { ok: true, html, svg: compiled.svg, cards: diagram.cards, meta, sourceEvidence, receipt: compiled.receipt };
 }
