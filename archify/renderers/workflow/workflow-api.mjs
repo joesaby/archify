@@ -6,6 +6,7 @@ import { validateEngineeringProfile } from '../shared/engineering-profiles.mjs';
 import { validateSchema } from '../shared/validator.mjs';
 import { verifyRepositoryEvidence } from '../shared/repository-evidence.mjs';
 import { prepareDiagramBrandMarks } from '../shared/brand-marks.mjs';
+import { withDiagnosticRecordingSuppressed } from '../shared/diagnostics.mjs';
 import { compileWorkflow } from './workflow-compiler.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -25,7 +26,16 @@ function readTemplate() {
 // author-facing failure comes back as { ok: false } instead of taking down
 // the host process; only an unclassified implementation error still throws.
 // The caller owns delivery: nothing here writes a file or claims completion.
-export async function renderWorkflow({
+//
+// Wrapped in withDiagnosticRecordingSuppressed so a host process that happens
+// to run with ARCHIFY_DIAGNOSTIC_FORMAT=json set (e.g. because it also shells
+// out to archify's own CLI elsewhere) never has this call's diagnostics leak
+// into that unrelated CLI failure history.
+export async function renderWorkflow(options = {}) {
+  return withDiagnosticRecordingSuppressed(() => renderWorkflowInternal(options));
+}
+
+async function renderWorkflowInternal({
   workflow,
   qualityProfile,
   repoRoot,

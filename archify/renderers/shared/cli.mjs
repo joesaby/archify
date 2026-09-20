@@ -375,13 +375,22 @@ export function validateCrossCollectionContracts(diagramType, diagram) {
 }
 
 // Accessible name for the generated diagram SVG.
-export function svgRootAttrs(meta, explicitQualityProfile) {
+export function svgRootAttrs(meta, explicitQualityProfile, { profileIsAuthoritative = false } = {}) {
   const animation = meta.animation === 'trace' ? ' data-animation="trace"' : '';
   const preset = ` data-preset="${esc(meta.visual_preset || 'classic')}"`;
   const engineeringProfile = meta.engineering_profile
     ? ` data-engineering-profile="${esc(meta.engineering_profile)}"`
     : '';
-  const requestedProfile = explicitQualityProfile || process.env.ARCHIFY_QUALITY_PROFILE || meta.quality_profile;
+  // A caller that has already resolved its own quality policy (e.g. a
+  // compiler weighing an explicit param against authored meta) must not have
+  // that decision second-guessed by this process's environment — that would
+  // let an in-process library caller's render silently pick up an ambient
+  // ARCHIFY_QUALITY_PROFILE the caller never asked for. Only a renderer with
+  // no such resolution of its own (still reading straight from meta here)
+  // falls back to the environment, matching today's CLI behavior.
+  const requestedProfile = profileIsAuthoritative
+    ? explicitQualityProfile
+    : explicitQualityProfile || process.env.ARCHIFY_QUALITY_PROFILE || meta.quality_profile;
   const qualityProfile = requestedProfile === 'showcase' ? 'showcase' : 'standard';
   const advisory = requestedProfile ? '' : ' data-quality-gates="advisory"';
   return `role="img" lang="${esc(resolveLocale(meta.locale))}" aria-labelledby="archify-diagram-title archify-diagram-description"${animation}${preset}${engineeringProfile} data-quality-profile="${esc(qualityProfile)}"${advisory}`;
