@@ -48,10 +48,10 @@ test('a failed renderWorkflow call does not leak diagnostics into a later unrela
 
     const broken = workflow();
     broken.meta.views = [{ id: 'view', label: 'View', focus: ['missing'] }];
-    const alsoFailed = await renderWorkflow({ workflow: broken, prepareBrandMarks: false });
+    const alsoFailed = await renderWorkflow({ workflow: broken });
     assert.deepEqual(alsoFailed.diagnostics.map(({ code }) => code), ['guided-view/invalid']);
 
-    const ok = await renderWorkflow({ workflow: workflow(), prepareBrandMarks: false });
+    const ok = await renderWorkflow({ workflow: workflow() });
     assert.equal(ok.ok, true, JSON.stringify(ok.diagnostics));
 
     // Only now does a real CLI failure happen; its report must contain

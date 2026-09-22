@@ -35,7 +35,7 @@ test('renderWorkflow stays advisory regardless of an ambient ARCHIFY_QUALITY_PRO
   const document = workflow();
 
   delete process.env.ARCHIFY_QUALITY_PROFILE;
-  const baseline = await renderWorkflow({ workflow: document, prepareBrandMarks: false });
+  const baseline = await renderWorkflow({ workflow: document });
   assert.equal(baseline.ok, true, JSON.stringify(baseline.diagnostics));
   assert.match(baseline.svg, /data-quality-gates="advisory"/);
   assert.match(baseline.svg, /data-quality-profile="standard"/);
@@ -45,7 +45,7 @@ test('renderWorkflow stays advisory regardless of an ambient ARCHIFY_QUALITY_PRO
   // reasons (e.g. it also shells out to archify's own CLI elsewhere) must
   // not have that leak into a library call that asked for nothing explicit.
   process.env.ARCHIFY_QUALITY_PROFILE = 'showcase';
-  const withAmbientEnv = await renderWorkflow({ workflow: document, prepareBrandMarks: false });
+  const withAmbientEnv = await renderWorkflow({ workflow: document });
   assert.equal(withAmbientEnv.ok, true, JSON.stringify(withAmbientEnv.diagnostics));
   assert.equal(withAmbientEnv.svg, baseline.svg);
   assert.match(withAmbientEnv.svg, /data-quality-gates="advisory"/);
@@ -58,7 +58,7 @@ test('renderWorkflow still honors an explicit qualityProfile argument under the 
   process.env.ARCHIFY_QUALITY_PROFILE = 'standard';
   const document = workflow();
 
-  const result = await renderWorkflow({ workflow: document, qualityProfile: 'showcase', prepareBrandMarks: false });
+  const result = await renderWorkflow({ workflow: document, qualityProfile: 'showcase' });
   assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
   assert.match(result.svg, /data-quality-profile="showcase"/);
   assert.doesNotMatch(result.svg, /data-quality-gates="advisory"/);

@@ -22,7 +22,9 @@ function readTemplate() {
 
 // In-memory counterpart to render-workflow.mjs: same validation and resource
 // preparation as the CLI's loadDiagramWithBrandMarks + compileWorkflow, minus
-// argv/file I/O. Never installs the process-level diagnostics boundary, so an
+// argv/input-file handling and output writes. Resource preparation can still
+// read files or fetch pinned brand resources, and the HTML template is read
+// on first use. Never installs the process-level diagnostics boundary, so an
 // author-facing failure comes back as { ok: false } instead of taking down
 // the host process; only an unclassified implementation error still throws.
 // The caller owns delivery: nothing here writes a file or claims completion.
@@ -39,7 +41,6 @@ async function renderWorkflowInternal({
   workflow,
   qualityProfile,
   repoRoot,
-  prepareBrandMarks = true,
 } = {}) {
   if (!workflow || typeof workflow !== 'object' || Array.isArray(workflow)) {
     throw new TypeError('renderWorkflow requires one parsed workflow document object.');
@@ -53,7 +54,7 @@ async function renderWorkflowInternal({
     validateCrossCollectionContracts('workflow', diagram);
     validateEngineeringProfile('workflow', diagram);
     sourceEvidence = verifyRepositoryEvidence('workflow', diagram, repoRoot);
-    if (prepareBrandMarks) await prepareDiagramBrandMarks('workflow', diagram);
+    await prepareDiagramBrandMarks('workflow', diagram);
   } catch (error) {
     if (!error?.archifyDiagnostics?.length) throw error;
     return { ok: false, error: error.message, diagnostics: error.archifyDiagnostics };

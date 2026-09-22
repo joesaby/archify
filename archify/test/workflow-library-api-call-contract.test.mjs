@@ -41,7 +41,7 @@ test('renderWorkflow requires a parsed document object, not argv or a path', asy
 
 test('renderWorkflow returns rendered output and matches the compiler used underneath', async () => {
   const input = deepFreeze(workflow());
-  const result = await renderWorkflow({ workflow: input, qualityProfile: 'showcase', prepareBrandMarks: false });
+  const result = await renderWorkflow({ workflow: input, qualityProfile: 'showcase' });
   assert.equal(result.ok, true, JSON.stringify(result.diagnostics));
   assert.match(result.html, /<svg/);
   assert.equal(result.html.includes(result.svg.trim().slice(0, 40)), true);
@@ -55,9 +55,9 @@ test('renderWorkflow never mutates the caller\'s document and stays independent 
   const before = structuredClone(input);
 
   const [first, second, third] = await Promise.all([
-    renderWorkflow({ workflow: input, qualityProfile: 'showcase', prepareBrandMarks: false }),
-    renderWorkflow({ workflow: input, qualityProfile: 'standard', prepareBrandMarks: false }),
-    renderWorkflow({ workflow: input, qualityProfile: 'showcase', prepareBrandMarks: false }),
+    renderWorkflow({ workflow: input, qualityProfile: 'showcase' }),
+    renderWorkflow({ workflow: input, qualityProfile: 'standard' }),
+    renderWorkflow({ workflow: input, qualityProfile: 'showcase' }),
   ]);
 
   assert.deepEqual(input, before);
@@ -72,12 +72,12 @@ test('renderWorkflow never mutates the caller\'s document and stays independent 
 
 test('renderWorkflow never installs the CLI-only process-level diagnostics boundary', async () => {
   assert.equal(globalThis[BOUNDARY_KEY], undefined);
-  await renderWorkflow({ workflow: workflow(), prepareBrandMarks: false });
+  await renderWorkflow({ workflow: workflow() });
   assert.equal(globalThis[BOUNDARY_KEY], undefined);
 
   const broken = workflow();
   broken.edges.push({ id: 'ab', from: 'b', to: 'a' });
-  const result = await renderWorkflow({ workflow: broken, prepareBrandMarks: false });
+  const result = await renderWorkflow({ workflow: broken });
   assert.equal(result.ok, false);
   assert.equal(globalThis[BOUNDARY_KEY], undefined);
 });
@@ -85,13 +85,13 @@ test('renderWorkflow never installs the CLI-only process-level diagnostics bound
 test('renderWorkflow enforces guided-view and relationship-id contracts', async () => {
   const duplicateEdgeIds = workflow();
   duplicateEdgeIds.edges.push({ id: 'ab', from: 'b', to: 'a', label: 'reply' });
-  const viaLibrary = await renderWorkflow({ workflow: duplicateEdgeIds, prepareBrandMarks: false });
+  const viaLibrary = await renderWorkflow({ workflow: duplicateEdgeIds });
   assert.equal(viaLibrary.ok, false);
   assert.deepEqual(viaLibrary.diagnostics.map((entry) => entry.code), ['relationship/duplicate-id']);
 
   const unknownFocus = workflow();
   unknownFocus.meta.views = [{ id: 'view-1', label: 'View 1', focus: ['does-not-exist'] }];
-  const result = await renderWorkflow({ workflow: unknownFocus, prepareBrandMarks: false });
+  const result = await renderWorkflow({ workflow: unknownFocus });
   assert.equal(result.ok, false);
   assert.deepEqual(result.diagnostics.map((entry) => entry.code), ['guided-view/invalid']);
 });
@@ -99,7 +99,7 @@ test('renderWorkflow enforces guided-view and relationship-id contracts', async 
 test('renderWorkflow reports a compiler-level failure as data, not an exception', async () => {
   const invalid = workflow();
   invalid.semanticChecks = { requiredEdges: [{ from: 'b', to: 'a' }] };
-  const result = await renderWorkflow({ workflow: invalid, prepareBrandMarks: false });
+  const result = await renderWorkflow({ workflow: invalid });
   assert.equal(result.ok, false);
   assert.deepEqual(result.diagnostics.map((entry) => entry.code), ['workflow/required-edge']);
   assert.equal(result.html, undefined);
