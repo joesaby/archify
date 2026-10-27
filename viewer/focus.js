@@ -26,8 +26,18 @@
       var downstreamCount = document.getElementById('focus-reach-downstream-count');
       var relationshipList = document.getElementById('relationship-lens-list');
       var copyBtn = document.getElementById('btn-focus-copy');
+      var explainBtn = document.getElementById('btn-focus-explain');
+      var explanationFace = document.getElementById('focus-explanation');
+      var explanationTitle = document.getElementById('focus-explanation-title');
+      var explanationBody = document.getElementById('focus-explanation-body');
+      var explanationBack = document.getElementById('focus-explanation-back');
+      var explanationBaseHeight = 0;
       var relationsBtn = document.getElementById('btn-focus-relations');
       var clearBtn = document.getElementById('btn-focus-clear');
+      var parentBackBar = document.getElementById('parent-back-bar');
+      var parentBackBtn = document.getElementById('btn-parent-back');
+      var drilldownsSection = document.getElementById('focus-drilldowns');
+      var drilldownsList = document.getElementById('focus-drilldowns-list');
       var moveBtn = document.getElementById('btn-focus-move');
       var activeIds = [];
       var hoveredRelationship = null;
@@ -374,7 +384,78 @@
         });
         evidence.hidden = false;
       }
+      function explanationFor(id) {
+        return Archify.explanations && typeof Archify.explanations.node === 'function' ? Archify.explanations.node(id) : null;
+      }
+      function compactPassportViewport() {
+        return window.innerWidth <= 720 && window.innerHeight <= 480;
+      }
+      function compactPassportHeight() {
+        var toolbar = document.querySelector('.toolbar');
+        var top = Math.max(8, toolbar ? toolbar.getBoundingClientRect().bottom + 8 : 8);
+        chip.style.setProperty('--passport-viewport-top', top + 'px');
+        return Math.max(0, window.innerHeight - top - 8);
+      }
+      function closeExplanation(options) {
+        options = options || {};
+        if (!explanationFace) return false;
+        var wasOpen = chip.getAttribute('data-explaining') === 'true';
+        chip.removeAttribute('data-explaining');
+        chip.style.height = '';
+        explanationBaseHeight = 0;
+        explanationFace.hidden = true;
+        if (wasOpen) placeRelationshipLens();
+        if (wasOpen && options.restoreFocus !== false && explainBtn && !explainBtn.hidden) {
+          try { explainBtn.focus({ preventScroll: true }); } catch (_) { try { explainBtn.focus(); } catch (_) {} }
+          if (compactPassportViewport()) {
+            var controlRect = explainBtn.getBoundingClientRect();
+            var panelRect = chip.getBoundingClientRect();
+            if (controlRect.bottom > panelRect.bottom) chip.scrollTop += controlRect.bottom - panelRect.bottom;
+            else if (controlRect.top < panelRect.top) chip.scrollTop -= panelRect.top - controlRect.top;
+          }
+        }
+        return wasOpen;
+      }
+      function fitExplanation() {
+        if (chip.getAttribute('data-explaining') !== 'true') return;
+        var rect = container.getBoundingClientRect();
+        var padding = window.innerWidth <= 720 ? 8 : 16;
+        var available = Math.max(0, Math.min(rect.bottom - padding, window.innerHeight - padding)
+          - Math.max(rect.top + padding, padding));
+        if (compactPassportViewport()) available = compactPassportHeight();
+        var needed = explanationFace.scrollHeight - explanationBody.clientHeight + explanationBody.scrollHeight + 2;
+        chip.style.height = Math.ceil(Math.min(available, Math.max(explanationBaseHeight, needed))) + 'px';
+      }
+      function openExplanation() {
+        if (!explanationFace || chip.hidden || activeIds.length !== 1) return false;
+        var text = explanationFor(activeIds[0]);
+        if (!text) return false;
+        var title = label.textContent;
+        explanationTitle.textContent = title;
+        while (explanationBody.firstChild) explanationBody.removeChild(explanationBody.firstChild);
+        text.split(/\n\s*\n/).forEach(function (paragraph) {
+          var trimmed = paragraph.trim();
+          if (!trimmed) return;
+          var p = document.createElement('p');
+          p.textContent = trimmed;
+          explanationBody.appendChild(p);
+        });
+        explanationBaseHeight = chip.offsetHeight;
+        explanationFace.hidden = false;
+        chip.setAttribute('data-explaining', 'true');
+        explanationBody.scrollTop = 0;
+        chip.scrollTop = 0;
+        fitExplanation();
+        placeRelationshipLens();
+        if (explanationBack) { try { explanationBack.focus({ preventScroll: true }); } catch (_) { try { explanationBack.focus(); } catch (_) {} } }
+        return true;
+      }
+      function toggleExplanation() {
+        return chip.getAttribute('data-explaining') === 'true' ? !closeExplanation() : openExplanation();
+      }
       function renderPassport(id, node) {
+        closeExplanation({ restoreFocus: false });
+        if (explainBtn) explainBtn.hidden = !explanationFor(id);
         setPassportValue(detail, node.getAttribute('data-node-sublabel'));
         setPassportValue(kind, viewerKindLabel(node.getAttribute('data-node-kind') || 'node'));
         setPassportValue(context, node.getAttribute('data-node-context'));
@@ -382,8 +463,154 @@
         setPassportValue(document.getElementById('focus-brand'), node.getAttribute('data-node-brand'));
         semanticId.textContent = id;
         semanticId.hidden = false;
+        renderDrilldowns(node);
         renderSourceEvidence(id);
       }
+      /**
+       * 仅允许同目录文件名.html（可选 ?query / #fragment）。
+       * 与 schema relativeHtmlHref / isSiblingHtmlHref 对齐：拒绝协议、/、..，防跳出产物目录。
+       */
+      function isSafeRelativeHtmlHref(value) {
+        if (typeof value !== 'string') return false;
+        var href = value.trim();
+        if (!href || href.length > 512) return false;
+        return /^[A-Za-z0-9][A-Za-z0-9._-]*\.html(?:\?[A-Za-z0-9._~/=&%+!?$-]*)?(?:#[A-Za-z0-9._~/=&%+!?$-]*)?$/.test(href);
+      }
+      function currentPageHref() {
+        var parts = (location.pathname || '').split('/');
+        var filename = parts[parts.length - 1] || '';
+        return withReaderContext(filename);
+      }
+      /**
+       * 跳子图时带上 ?from=当前页，子图无 meta.parentHref 时仍可返回。
+       */
+      function withReaderContext(targetHref) {
+        if (!isSafeRelativeHtmlHref(targetHref)) return null;
+        var hashIndex = targetHref.indexOf('#');
+        var hash = hashIndex >= 0 ? targetHref.slice(hashIndex) : '';
+        var target = hashIndex >= 0 ? targetHref.slice(0, hashIndex) : targetHref;
+        var queryIndex = target.indexOf('?');
+        var filename = queryIndex >= 0 ? target.slice(0, queryIndex) : target;
+        var params = new URLSearchParams(queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
+        var current = new URLSearchParams(location.search);
+        ['theme', 'embed', 'present'].forEach(function (key) {
+          if (!params.has(key) && current.has(key)) params.set(key, current.get(key));
+        });
+        var query = params.toString();
+        return filename + (query ? '?' + query : '') + hash;
+      }
+      function hrefWithFrom(targetHref) {
+        var next = withReaderContext(targetHref);
+        if (!next) return null;
+        var from = currentPageHref();
+        if (!from || !isSafeRelativeHtmlHref(from)) return next;
+        var hashIndex = next.indexOf('#');
+        var hash = hashIndex >= 0 ? next.slice(hashIndex) : '';
+        var target = hashIndex >= 0 ? next.slice(0, hashIndex) : next;
+        var queryIndex = target.indexOf('?');
+        var filename = queryIndex >= 0 ? target.slice(0, queryIndex) : target;
+        var params = new URLSearchParams(queryIndex >= 0 ? target.slice(queryIndex + 1) : '');
+        params.set('from', from);
+        return filename + '?' + params.toString() + hash;
+      }
+      function resolveParentHref() {
+        try {
+          var from = new URLSearchParams(location.search).get('from');
+          if (from && isSafeRelativeHtmlHref(from)) return from.trim();
+        } catch (_) {}
+        var authored = svg.getAttribute('data-parent-href');
+        if (authored && isSafeRelativeHtmlHref(authored)) return authored.trim();
+        return null;
+      }
+      function navigateToRelativeHtml(href) {
+        var next = hrefWithFrom(href);
+        if (!next) return false;
+        location.assign(next);
+        return true;
+      }
+      function navigateToParent() {
+        var parent = resolveParentHref();
+        if (!parent) return false;
+        location.assign(withReaderContext(parent));
+        return true;
+      }
+      function syncParentBackControls() {
+        var parent = resolveParentHref();
+        if (parentBackBar) parentBackBar.hidden = !parent;
+        if (parentBackBtn) {
+          if (parent) parentBackBtn.setAttribute('data-parent-href', parent);
+          else parentBackBtn.removeAttribute('data-parent-href');
+        }
+      }
+      /**
+       * 渲染时 <a href> 是裸文件名；打开页后再补 ?from=，子图无 parentHref 也能回。
+       * 只改 data-archify-drilldown，不动 Passport / 证据链接。
+       */
+      function rewriteDrilldownAnchors() {
+        Array.prototype.forEach.call(svg.querySelectorAll('a[data-archify-drilldown]'), function (anchor) {
+          var authored = anchor.getAttribute('href');
+          anchor.setAttribute('data-archify-authored-href', authored);
+          var next = hrefWithFrom(authored);
+          if (next) anchor.setAttribute('href', next);
+        });
+      }
+      function parseNodeDrilldowns(node) {
+        if (!node) return [];
+        var raw = node.getAttribute('data-node-drilldowns');
+        if (!raw) return [];
+        try {
+          var list = JSON.parse(raw);
+          if (!Array.isArray(list)) return [];
+          return list.filter(function (entry) {
+            return entry
+              && typeof entry === 'object'
+              && isSafeRelativeHtmlHref(entry.href)
+              && entry.label
+              && String(entry.label).trim();
+          }).map(function (entry) {
+            return {
+              href: String(entry.href).trim(),
+              label: String(entry.label).trim(),
+              diagram_type: entry.diagram_type ? String(entry.diagram_type).trim() : ''
+            };
+          });
+        } catch (_) {
+          return [];
+        }
+      }
+      function openPrimaryDrilldown(node) {
+        var targets = parseNodeDrilldowns(node);
+        if (!targets.length) return false;
+        return navigateToRelativeHtml(targets[0].href);
+      }
+
+      function renderDrilldowns(node) {
+        if (!drilldownsSection || !drilldownsList) return;
+        drilldownsList.textContent = '';
+        var targets = parseNodeDrilldowns(node);
+        if (!targets.length) {
+          drilldownsSection.hidden = true;
+          return;
+        }
+        targets.forEach(function (target, index) {
+          var link = document.createElement('a');
+          link.className = 'semantic-passport-drilldown';
+          link.href = hrefWithFrom(target.href) || target.href;
+          link.setAttribute('data-drilldown-index', String(index));
+          link.setAttribute('aria-label', viewerText('viewer.passport.drilldowns.open', { label: target.label }));
+          var title = document.createElement('span');
+          title.textContent = target.label;
+          link.appendChild(title);
+          if (target.diagram_type) {
+            var type = document.createElement('small');
+            type.textContent = target.diagram_type;
+            link.appendChild(type);
+          }
+          drilldownsList.appendChild(link);
+        });
+        drilldownsSection.hidden = false;
+      }
+
       function relationshipsFor(id, byId) {
         var seen = {};
         var relationships = [];
@@ -419,7 +646,7 @@
       function relationshipEdgeShapes(edge) {
         if (!edge) return [];
         if (/^(path|line|polyline)$/i.test(edge.tagName || '')) return [edge];
-        return Array.prototype.slice.call(edge.querySelectorAll('path, line, polyline'));
+        return Array.prototype.slice.call(edge.querySelectorAll('path:not([data-ambient-flow-overlay]), line, polyline'));
       }
       function relationshipHitRecords() {
         var recordsByKey = {};
@@ -523,6 +750,8 @@
       }
       function relationshipPulseGeometry(shape) {
         var clone = shape.cloneNode(false);
+        if (shape.getAttribute('data-motion-path')) clone.setAttribute('d', relationshipTokenPath(shape));
+        clone.removeAttribute('data-motion-path');
         clone.removeAttribute('id');
         clone.removeAttribute('class');
         clone.removeAttribute('style');
@@ -567,7 +796,7 @@
       function relationshipTokenPath(shape) {
         if (!shape) return '';
         var tagName = String(shape.tagName || '').toLowerCase();
-        if (tagName === 'path') return shape.getAttribute('d') || '';
+        if (tagName === 'path') return shape.getAttribute('data-motion-path') || shape.getAttribute('d') || '';
         if (tagName === 'line') {
           return 'M ' + shape.getAttribute('x1') + ' ' + shape.getAttribute('y1') +
             ' L ' + shape.getAttribute('x2') + ' ' + shape.getAttribute('y2');
@@ -911,6 +1140,7 @@
           inspectRelationship(target.getAttribute('data-relationship-key'));
         });
         relationshipHitOverlay.addEventListener('keydown', function (event) {
+          if (event.isComposing || event.keyCode === 229) return;
           var target = event.target.closest('[data-relationship-hit-key]');
           if (!target) return;
           if (event.key === 'Escape' && pinnedRelationshipKey) {
@@ -1156,11 +1386,17 @@
           lensFrame = 0;
         }
         if (chip.hidden || activeIds.length !== 1) return;
+        if (compactPassportViewport()) compactPassportHeight();
+        else {
+          chip.style.removeProperty('--passport-viewport-top');
+          chip.scrollTop = 0;
+        }
         var node = svg.querySelector('[data-node-id="' + activeIds[0] + '"]');
         if (!node) return;
         var containerRect = container.getBoundingClientRect();
         var nodeRect = node.getBoundingClientRect();
         if (containerRect.bottom <= 0 || containerRect.top >= window.innerHeight) return;
+        fitExplanation();
         var padding = window.innerWidth <= 720 ? 8 : 16;
         var visibleTop = Math.max(padding, -containerRect.top + padding);
         var visibleBottom = Math.min(containerRect.height - padding, window.innerHeight - containerRect.top - padding);
@@ -1269,6 +1505,8 @@
           node.setAttribute('aria-pressed', 'false');
         });
         edges().forEach(function (edge) { edge.removeAttribute('data-focus-match'); });
+        closeExplanation({ restoreFocus: false });
+        if (explainBtn) explainBtn.hidden = true;
         chip.hidden = true;
         label.textContent = '';
         detail.textContent = '';
@@ -1328,6 +1566,11 @@
           if (byId[id] && normalized.indexOf(id) === -1) normalized.push(id);
         });
         if (!normalized.length) return false;
+        // Hash restoration and internal selections use this path too. Reveal
+        // tree ancestors before measuring the selected node for its lens.
+        if (Archify.treeBranches && Archify.treeBranches.active) {
+          normalized.forEach(function (id) { Archify.treeBranches.reveal(id); });
+        }
         if (normalized.length === activeIds.length && normalized.every(function (id, index) { return activeIds[index] === id; }) && options.toggle !== false) {
           clear();
           return true;
@@ -1385,31 +1628,14 @@
         return setMany([id], options);
       }
 
-      function fallbackCopy(value) {
-        var field = document.createElement('textarea');
-        field.value = value;
-        field.setAttribute('readonly', '');
-        field.style.position = 'fixed';
-        field.style.opacity = '0';
-        document.body.appendChild(field);
-        field.select();
-        var copied = false;
-        try { copied = document.execCommand('copy'); } catch (_) {}
-        field.remove();
-        return copied;
-      }
-
       function copyFocusLink() {
         if (activeIds.length !== 1) return Promise.resolve(false);
         var record = pinnedRelationshipRecord();
         var relationId = record && record.id;
-        var value = location.href.replace(/#.*$/, '') + (relationId
-          ? '#relation=' + encodeURIComponent(relationId)
-          : '#focus=' + encodeURIComponent(activeIds[0]) + (reachabilityMode ? '&reach=' + reachabilityMode : ''));
-        var copy = navigator.clipboard && typeof navigator.clipboard.writeText === 'function'
-          ? navigator.clipboard.writeText(value).then(function () { return true; }).catch(function () { return fallbackCopy(value); })
-          : Promise.resolve(fallbackCopy(value));
-        return copy.then(function (copied) {
+        var value = readerLink(relationId
+          ? 'relation=' + encodeURIComponent(relationId)
+          : 'focus=' + encodeURIComponent(activeIds[0]) + (reachabilityMode ? '&reach=' + reachabilityMode : ''));
+        return (value === null ? Promise.resolve(false) : copyReaderText(value)).then(function (copied) {
           copyBtn.textContent = viewerText(copied ? 'viewer.common.copied' : 'viewer.common.copyFailed');
           copyBtn.setAttribute('aria-label', copied
             ? viewerText(relationId ? 'viewer.passport.copy.pinned.success' : 'viewer.passport.copy.focused.success')
@@ -1425,6 +1651,18 @@
         if (container.getAttribute('data-just-panned') === 'true') return;
         var node = event.target.closest('[data-node-id]');
         if (node) {
+          // Ctrl/Cmd+单击：跳过 focus，直接打开 Passport 列表第一项子图
+          if ((event.ctrlKey || event.metaKey) && openPrimaryDrilldown(node)) {
+            event.preventDefault();
+            return;
+          }
+          // Alt+单击：即使节点包了原生 <a> 也不跳，只 focus（审稿：探路仍要能选中）
+          if (event.altKey) {
+            event.preventDefault();
+          } else if (event.target.closest('a[data-archify-drilldown]')) {
+            // 单目标：交给浏览器跟 <a>，不再 set(id) 以免抢导航
+            return;
+          }
           var id = node.getAttribute('data-node-id');
           set(id);
           if (activeIds.indexOf(id) !== -1 && Archify.view && typeof Archify.view.reveal === 'function') {
@@ -1433,6 +1671,16 @@
         }
         else if (activeIds.length) clear();
       });
+      // 双击同样默认打开排在最上面的子图（与 Ctrl+单击一致）
+      svg.addEventListener('dblclick', function (event) {
+        if (container.getAttribute('data-just-panned') === 'true') return;
+        var node = event.target.closest('[data-node-id]');
+        if (!node) return;
+        if (openPrimaryDrilldown(node)) {
+          event.preventDefault();
+        }
+      });
+
       svg.addEventListener('keydown', function (event) {
         var node = event.target.closest('[data-node-id]');
         if (!node || (event.key !== 'Enter' && event.key !== ' ')) return;
@@ -1456,6 +1704,13 @@
       moveBtn.addEventListener('keydown', moveLensWithKeyboard);
       clearBtn.addEventListener('click', function () { clear({ restoreFocus: true }); });
       copyBtn.addEventListener('click', copyFocusLink);
+      if (explainBtn) explainBtn.addEventListener('click', function (event) { event.stopPropagation(); toggleExplanation(); });
+      if (explanationBack) {
+        explanationBack.addEventListener('click', function (event) { event.stopPropagation(); closeExplanation(); });
+      }
+      if (parentBackBtn) parentBackBtn.addEventListener('click', navigateToParent);
+      rewriteDrilldownAnchors();
+      syncParentBackControls();
       upstreamBtn.addEventListener('click', function () { applyReachability('upstream'); });
       downstreamBtn.addEventListener('click', function () { applyReachability('downstream'); });
       relationsBtn.addEventListener('click', function () {
@@ -1509,6 +1764,7 @@
         syncRelationshipPreview();
       });
       relationshipList.addEventListener('keydown', function (event) {
+        if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp' && event.key !== 'Home' && event.key !== 'End') return;
         var buttons = Array.prototype.slice.call(relationshipList.querySelectorAll('[data-relationship-target]'));
         if (!buttons.length) return;
@@ -1537,12 +1793,21 @@
         var target = event.target;
         if (chip.hidden || !target || typeof target.closest !== 'function' || chip.contains(target)) return;
         if (container.getAttribute('data-just-panned') === 'true') return;
-        if (target.closest('[data-node-id], [data-relationship-hit-key], .overview-map')) return;
+        // Export consumes the active semantic snapshot; its controls are not
+        // an outside selection. Genuine outside activation still clears it.
+        if (target.closest('[data-node-id], [data-relationship-hit-key], .overview-map, #btn-export, #export-menu')) return;
         clear();
       }, true);
       window.addEventListener('scroll', requestLensPlacement, { passive: true });
       window.addEventListener('resize', requestLensPlacement);
       container.addEventListener('scroll', requestLensPlacement, { passive: true });
+      // Reader and Chrome may finish resizing the stage after window resize.
+      // The absolute Passport does not resize its container when reclamped.
+      if (typeof ResizeObserver === 'function') {
+        new ResizeObserver(function () {
+          if (!chip.hidden) requestLensPlacement();
+        }).observe(container);
+      }
       document.addEventListener('visibilitychange', function () {
         if (document.hidden) removeRelationshipPulse();
       });
@@ -1587,6 +1852,8 @@
         setMany: setMany,
         clear: clear,
         copyLink: copyFocusLink,
+        explain: toggleExplanation,
+        explaining: function () { return chip.getAttribute('data-explaining') === 'true'; },
         reach: applyReachability,
         clearReach: clearReachability,
         reachabilitySnapshot: reachabilitySnapshot,

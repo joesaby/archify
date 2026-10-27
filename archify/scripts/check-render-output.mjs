@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 
 import fs from 'node:fs';
+import { isExplainerHtml, checkExplainerHtml } from '../explainer/check.mjs';
+import { analyzeSvgPath } from '../renderers/shared/svg-path-analysis.mjs';
+import { textUnits } from '../renderers/shared/utils.mjs';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import { collectAmbiguousCorridors, collectArrowheadCollisions, collectBorderRuns, collectLabelCanvasOverflow, collectLabelRouteClearance, collectRouteRhythmIssues, describeLabelCanvasOverflow, formatRect, forwardCollinearAnalysisSegments, minimumLabelRouteClearance, routeBudgetMetrics } from '../renderers/shared/geometry.mjs';
+import { collectAmbiguousCorridors, collectArrowheadCollisions, collectBorderRuns, collectLabelCanvasOverflow, collectLabelRouteClearance, collectRouteRhythmIssues, describeLabelCanvasOverflow, formatRect, forwardCollinearAnalysisSegments, minimumLabelRouteClearance, normalizeRoutePoints, routeBudgetMetrics } from '../renderers/shared/geometry.mjs';
 import {
   DESKTOP_READABILITY_VIEWPORT,
   DESKTOP_READER_DIAGRAM_WIDTH,
@@ -16,6 +19,16 @@ import {
 } from '../renderers/shared/desktop-readability.mjs';
 
 const input = process.argv[2];
+const DEFAULT_MAX_CROSSING_PAIR_CHECKS = 50_000;
+const DEFAULT_MAX_CROSSING_SEGMENT_PAIR_CHECKS = 3_000_000;
+const maxCrossingPairChecks = positiveIntegerEnvironment(
+  'ARCHIFY_CHECK_MAX_CROSSING_PAIR_CHECKS',
+  DEFAULT_MAX_CROSSING_PAIR_CHECKS,
+);
+const maxCrossingSegmentPairChecks = positiveIntegerEnvironment(
+  'ARCHIFY_CHECK_MAX_CROSSING_SEGMENT_PAIR_CHECKS',
+  DEFAULT_MAX_CROSSING_SEGMENT_PAIR_CHECKS,
+);
 
 if (!input || input === '-h' || input === '--help') {
   console.error('Usage: node scripts/check-render-output.mjs <diagram.html>');
@@ -38,7 +51,15 @@ try {
   process.exit(1);
 }
 
+if (isExplainerHtml(html)) {
+  const result = checkExplainerHtml(html, { file: htmlPath });
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(result.ok ? 0 : 1);
+}
+
 const checks = [];
+const pathDiagnostics = [];
+const pathAnalyses = new Map();
 let composition = {
   schemaVersion: 1,
   profile: 'standard',
@@ -71,7 +92,11 @@ let composition = {
 
 const NON_FINITE_TOKEN = /\b(?:NaN|undefined|Infinity)\b/;
 // Consume comments/CDATA as whole tokens, including any tag-like prose.
-const SVG_TAG_TOKEN = /<!--[\s\S]*?(?:-->|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<(\/?)([A-Za-z][\w:-]*)(?=[\s/>])(?:[^>"']|"[^"]*"|'[^']*')*>/g;
+// A quote opens a quoted attribute value only right after '='; anywhere
+// else (for example the apostrophe in data-note=it's) it is literal text,
+// so the tag pattern anchors quoted spans to '=' and lets a lone quote
+// through as an ordinary character.
+const SVG_TAG_TOKEN = /<!--[\s\S]*?(?:-->|$)|<!\[CDATA\[[\s\S]*?(?:\]\]>|$)|<(\/?)([A-Za-z][\w:-]*)(?=[\s/>])(?:=\s*"[^"]*"|=\s*'[^']*'|[^>"']|["'])*>/g;
 const AUTOMATIC_CROSSOVER_UNDERLAY_TAG = /<path\b[^>]*\bdata-graph-role="automatic-crossover-underlay"[^>]*\/>/i;
 const HTML_VOID_ELEMENTS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
 const SVG_HTML_INTEGRATION_POINTS = new Set(['foreignobject', 'desc', 'title']);
@@ -101,12 +126,262 @@ function addCheck(name, ok, details = []) {
   checks.push({ name, ok, details });
 }
 
-const svgMatches = [...html.matchAll(/<svg\b[\s\S]*?<\/svg>/gi)];
-addCheck('single_svg', svgMatches.length === 1, [`found ${svgMatches.length} <svg> block(s)`]);
+// A '/' that ends an unquoted attribute value (for example data-note=value/>)
+// is value text per HTML, not the self-closing flag: parse5 keeps it, and the
+// finite_svg tests document x1="NaN/" for <line x1=NaN/>. A quote inside an
+// unquoted value is literal text too (data-note=it's/>), so a strip-the-quoted-
+// spans shortcut misreads that '/' as the flag. Walk the token with the same
+// value tracking as extractSvgBlocks: the flag is only a '/' that sits outside
+// every attribute value, immediately before the '>'.
+function isSelfClosingTag(token) {
+  let quote = null;
+  let value = 'none'; // 'none' | 'aname' (in attribute name) | 'afterName' (whitespace after a name) | 'pending' (just after '=') | 'unquoted'
+  let slash = false; // the previous char was a '/' outside any attribute value
+  for (let k = 1; k < token.length; k += 1) {
+    const ch = token[k];
+    if (quote !== null) {
+      if (ch === quote) { quote = null; value = 'none'; }
+      slash = false;
+    } else if (ch === '>') {
+      return slash;
+    } else if (value === 'aname') {
+      if (ch === '=') value = 'pending';
+      // Whitespace after a name does not end the attribute: a following '='
+      // still belongs to it (data-note = "a/>b"). Resetting to 'none' here
+      // made '=' start a new attribute, so the quoted '/>' that followed
+      // was read as the self-closing flag and the rest of the root was cut
+      // off. A '/' here can be the self-closing flag when it terminates
+      // the tag name (<svg/>): only a '/' immediately before '>' sets the
+      // flag, so remember it instead of clearing it. A '/' inside an
+      // unquoted value never reaches this branch (it stays 'unquoted'),
+      // and '<svg / >' clears the flag on the space that follows.
+      else if (/[ \t\n\f\r]/.test(ch)) value = 'afterName';
+      else if (ch === '/') value = 'none';
+      slash = ch === '/';
+    } else if (value === 'afterName') {
+      if (ch === '=') value = 'pending';
+      else if (ch === '/') value = 'none';
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'aname';
+      slash = ch === '/';
+    } else if (value === 'pending') {
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'unquoted';
+      slash = false;
+    } else if (value === 'unquoted') {
+      if (/[ \t\n\f\r]/.test(ch)) value = 'none';
+      slash = false;
+    } else {
+      if (ch === '=') value = 'aname';
+      else if (!/[ \t\n\f\r/]/.test(ch)) value = 'aname';
+      slash = ch === '/';
+    }
+  }
+  return false;
+}
 
-if (svgMatches.length === 1) {
-  const svg = svgMatches[0][0];
-  const svgRoot = svg.match(/<svg\b[^>]*>/i)?.[0] || '';
+// The root opener of a block: everything through the first '>' that sits
+// outside a quoted attribute value, walked with the same value tracking as
+// extractSvgBlocks. A quoted-spans pattern cannot express that rule: a lone
+// quote inside an unquoted value (data-note=x") opens a span there that
+// swallows the rest of the tag, the match fails, and every root attribute
+// (data-quality-profile included) is lost.
+function svgRootTag(block) {
+  let quote = null;
+  let value = 'none'; // 'none' | 'aname' (in attribute name) | 'afterName' (whitespace after a name) | 'pending' (just after '=') | 'unquoted'
+  for (let k = 0; k < block.length; k += 1) {
+    const ch = block[k];
+    if (quote !== null) {
+      if (ch === quote) { quote = null; value = 'none'; }
+    } else if (ch === '>') {
+      return block.slice(0, k + 1);
+    } else if (value === 'aname') {
+      if (ch === '=') value = 'pending';
+      else if (/[ \t\n\f\r]/.test(ch)) value = 'afterName';
+      else if (ch === '/') value = 'none';
+    } else if (value === 'afterName') {
+      // Whitespace after a name does not end the attribute: a following
+      // '=' still belongs to it (data-note = "a/>b").
+      if (ch === '=') value = 'pending';
+      else if (ch === '/') value = 'none';
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'aname';
+    } else if (value === 'pending') {
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'unquoted';
+    } else if (value === 'unquoted') {
+      if (/[ \t\n\f\r]/.test(ch)) value = 'none';
+    } else if (ch === '=') {
+      value = 'aname';
+    } else if (!/[ \t\n\f\r/]/.test(ch)) {
+      value = 'aname';
+    }
+  }
+  return '';
+}
+
+// Consume a tag from `from` (just past its name scan) through its '>',
+// honoring quoted attribute values with the same value tracking the block
+// scan uses: a quote opens a quoted value only right after '=', inside a
+// name or an unquoted value it is literal text. Returns the index of the
+// '>', or -1 when the tag never terminates.
+function endOfTag(source, from) {
+  let quote = null;
+  let value = 'none'; // 'none' | 'aname' (in attribute name) | 'afterName' (whitespace after a name) | 'pending' (just after '=') | 'unquoted'
+  let k = from;
+  while (k < source.length) {
+    const ch = source[k];
+    if (quote !== null) {
+      if (ch === quote) { quote = null; value = 'none'; }
+    } else if (ch === '>') {
+      return k;
+    } else if (value === 'aname') {
+      if (ch === '=') value = 'pending';
+      else if (/[ \t\n\f\r]/.test(ch)) value = 'afterName';
+      else if (ch === '/') value = 'none';
+    } else if (value === 'afterName') {
+      // Whitespace after a name does not end the attribute: a following
+      // '=' still belongs to it (data-note = "a/>b").
+      if (ch === '=') value = 'pending';
+      else if (ch === '/') value = 'none';
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'aname';
+    } else if (value === 'pending') {
+      if (ch === '"' || ch === "'") quote = ch;
+      else if (!/[ \t\n\f\r]/.test(ch)) value = 'unquoted';
+    } else if (value === 'unquoted') {
+      if (/[ \t\n\f\r]/.test(ch)) value = 'none';
+    } else if (ch === '=') {
+      value = 'aname';
+    } else if (!/[ \t\n\f\r/]/.test(ch)) {
+      value = 'aname';
+    }
+    k += 1;
+  }
+  return -1;
+}
+
+// Collect each top-level <svg> block. Matching lazily to the first </svg>
+// would cut a root short at a nested <svg> (for example inside foreignObject)
+// and drop the rest of the root from every check below; markup inside HTML
+// comments is not an element and must not count as a block either.
+//
+// The scan walks the source once, left to right, with the same quote- and
+// CDATA-aware token rules the other static checks use, so `<svg>` text inside
+// comments, CDATA sections, or quoted attribute values never moves the depth
+// counter. Case-insensitive like the HTML parser: <SVG> is the same element
+// as <svg>. A regex tokenizer is not used here: it retries its tag pattern
+// at every '<', so on a truncated candidate ending in unterminated quoted
+// tags each retry rescans the remaining suffix (quadratic overall), while
+// this scan consumes every position once.
+function extractSvgBlocks(source) {
+  const blocks = [];
+  let depth = 0;
+  let start = -1;
+  let i = 0;
+  while (i < source.length) {
+    const lt = source.indexOf('<', i);
+    if (lt === -1) break;
+    if (source.startsWith('<!--', lt)) {
+      // HTML also ends a comment on --!> and closes <!--> / <!---> outright.
+      let end = -1;
+      if (source[lt + 4] === '>') end = lt + 5;
+      else if (source.startsWith('->', lt + 4)) end = lt + 6;
+      else {
+        // Walk each '--' once instead of probing for --!> with a fresh
+        // suffix search per comment: with no --!> anywhere, that probe
+        // rescans the remaining suffix from every comment (quadratic).
+        let p = lt + 4;
+        while ((p = source.indexOf('--', p)) !== -1) {
+          if (source[p + 2] === '>') { end = p + 3; break; }
+          if (source[p + 2] === '!' && source[p + 3] === '>') { end = p + 4; break; }
+          p += 1;
+        }
+      }
+      i = end === -1 ? source.length : end;
+      continue;
+    }
+    if (source.startsWith('<![CDATA[', lt)) {
+      if (depth > 0) {
+        const end = source.indexOf(']]>', lt + 9);
+        i = end === -1 ? source.length : end + 3;
+      } else {
+        // Outside foreign content, <![CDATA[ is a bogus comment in HTML: it
+        // ends at the first '>' and the markup after it is real.
+        const end = source.indexOf('>', lt + 9);
+        i = end === -1 ? source.length : end + 1;
+      }
+      continue;
+    }
+    if (source.startsWith('<?', lt)) {
+      // A processing instruction is a bogus comment in HTML too: it ends
+      // at the first '>', so an <svg> inside it opens no element and the
+      // markup after that '>' stays real.
+      const end = source.indexOf('>', lt + 2);
+      i = end === -1 ? source.length : end + 1;
+      continue;
+    }
+    if (source.startsWith('<!', lt)) {
+      // Any other <!...> (a doctype, or a declaration like <!x) is a bogus
+      // comment in HTML: it ends at the first '>', so a <!-- inside it
+      // opens no comment and the markup after that '>' stays real.
+      const end = source.indexOf('>', lt + 2);
+      i = end === -1 ? source.length : end + 1;
+      continue;
+    }
+    let j = lt + 1;
+    const closing = source[j] === '/';
+    if (closing) j += 1;
+    const nameStart = j;
+    while (j < source.length && /[\w:-]/.test(source[j])) j += 1;
+    const name = source.slice(nameStart, j);
+    const after = source[j];
+    // Tag names end only at ASCII whitespace, '/' or '>' — JavaScript \s
+    // would also accept U+00A0 and friends, which HTML joins into the name.
+    if (!/^[A-Za-z]/.test(name) || (after !== undefined && !/[ \t\n\f\r/>]/.test(after))) {
+      // A rejected '<' is not always plain text. '</!' is a bogus comment in
+      // HTML that runs to its first '>', and a letter after '<' means the
+      // tag-name state swallowed the rest (e.g. <x"<svg>> is one malformed
+      // tag), so resuming at lt + 1 would expose an inner <svg> that HTML
+      // never tokenizes as an element. Anything else ('<3', '<<') is text,
+      // so resuming one byte later stays correct there.
+      if (source.startsWith('</!', lt)) {
+        const end = source.indexOf('>', lt + 3);
+        i = end === -1 ? source.length : end + 1;
+      } else if (/[A-Za-z]/.test(source[lt + 1] || '')) {
+        const gt = endOfTag(source, j);
+        i = gt === -1 ? source.length : gt + 1;
+      } else {
+        i = lt + 1;
+      }
+      continue;
+    }
+    // Consume the tag through its '>', honoring quoted attribute values.
+    // Per HTML, a quote opens a quoted value only right after '='; inside a
+    // name or an unquoted value it is literal text and the tag still ends
+    // at its '>'. An '=' in before-attribute-name position starts an
+    // attribute whose name is '=' (it does not open a value), so '=' moves
+    // to the attribute-name state instead of value-pending.
+    const gt = endOfTag(source, j);
+    if (gt === -1) break; // unterminated tag: the rest is its text
+    const token = source.slice(lt, gt + 1);
+    i = gt + 1;
+    if (name.toLowerCase() !== 'svg') continue;
+    if (closing) {
+      if (depth > 0 && --depth === 0) blocks.push(source.slice(start, gt + 1));
+    } else if (isSelfClosingTag(token)) {
+      if (depth === 0) blocks.push(token);
+    } else {
+      if (depth === 0) start = lt;
+      depth += 1;
+    }
+  }
+  return blocks;
+}
+
+const svgBlocks = extractSvgBlocks(html);
+addCheck('single_svg', svgBlocks.length === 1, [`found ${svgBlocks.length} <svg> block(s)`]);
+
+if (svgBlocks.length === 1) {
+  const svg = svgBlocks[0];
+  const svgRoot = svgRootTag(svg);
   const svgAttrs = parseAttrs(svgRoot);
   const qualityProfile = svgAttrs['data-quality-profile'] || 'standard';
   const workflowV2 = svgAttrs['data-layout-contract'] === 'readable-v2';
@@ -131,7 +406,13 @@ if (svgMatches.length === 1) {
     diagonal.length === 0,
     diagonal.map(({ arrow, segmentIndex }) => `${arrow.kind} ${arrow.index} segment ${segmentIndex + 1}: expected an orthogonal segment or an explicitly authored direct straight route; ${arrow.raw}`),
   );
-  const measuredRelationshipCrossings = collectRelationshipCrossings(arrows, workflowV2);
+  const crossingAnalysis = collectRelationshipCrossings(
+    arrows,
+    workflowV2,
+    maxCrossingPairChecks,
+    maxCrossingSegmentPairChecks,
+  );
+  const measuredRelationshipCrossings = crossingAnalysis.crossings;
   const resolvedCrossovers = measuredRelationshipCrossings.filter((hit) => (
     hit.left.crossoverHalo && hit.right.crossoverHalo
   ));
@@ -150,22 +431,23 @@ if (svgMatches.length === 1) {
     frames: compositionFrames,
   });
   const routedRelationships = arrows
-    .filter((arrow) => arrow.from && arrow.to && arrow.routePoints.length)
+    .filter((arrow) => arrow.from && arrow.to && arrow.routeSubpaths.some(points => points.length > 1))
     .map((arrow) => ({ relation: arrow, relationIndex: arrow.index, points: arrow.routePoints }));
   const nodeRects = svgAttrs.transform ? [] : collectUntransformedNodeRects(beforeLegend);
-  const routeMetrics = routeBudgetMetrics({ routedRelations: routedRelationships });
+  const routeMetrics = subpathBudgetMetrics(routedRelationships);
   // Architecture marks only one of its two Reader fits with its type.
   const crowdedSides = svgAttrs['data-diagram-type'] === 'architecture' || svgAttrs['data-reader-primary-text'] === '14'
     ? crowdedNodeSides(arrows, nodeRects) : [];
-  const routeRhythmIssues = collectRouteRhythmIssues({ routedRelations: routedRelationships });
-  const ambiguousCorridors = collectAmbiguousCorridors({
+  const routeRhythmIssues = subpathRhythmIssues(routedRelationships);
+  const ambiguousCorridors = subpathCorridors({
     routedRelations: routedRelationships,
     includeSharedEndpoints: (left, right) => workflowV2 || (left.independentPorts && right.independentPorts),
     allowShortWorkflowTrunks: workflowV2,
     includeSharedEndpointCounterflow: (left, right) => left.automaticWorkflowRoute && right.automaticWorkflowRoute,
   });
   const arrowheadCollisions = collectArrowheadCollisions({
-    routedRelations: routedRelationships.filter((entry) => workflowV2 || entry.relation.independentPorts),
+    routedRelations: routedRelationships.filter((entry) => workflowV2 || entry.relation.independentPorts)
+      .flatMap(entry => routeParts(entry).filter(part => part.targetEndpoint)),
     allowShortWorkflowTrunks: workflowV2,
   });
   const relationshipLabels = collectRelationshipLabelMasks(beforeLegend, arrows);
@@ -174,13 +456,14 @@ if (svgMatches.length === 1) {
     arrows, labels: relationshipLabels,
   });
   const sequenceColumnSpace = collectSequenceColumnSpace({ svgAttrs, fragment: beforeLegend, nodeRects, arrows });
+  const sequenceNoteBorders = collectSequenceNoteBorders({ svgAttrs, fragment: beforeLegend, frames: compositionFrames, arrows });
   const labelClearanceThreshold = qualityProfile === 'showcase' ? 4 : 2;
-  const labelRouteMeasurements = collectLabelRouteClearance({
+  const labelRouteMeasurements = subpathLabelClearance({
     labels: relationshipLabels,
     routedRelations: arrows.map((arrow) => ({ relation: arrow, relationIndex: arrow.index, points: arrow.routePoints })),
     threshold: Number.MAX_VALUE,
   });
-  const labelRouteClearance = collectLabelRouteClearance({
+  const labelRouteClearance = subpathLabelClearance({
     labels: relationshipLabels,
     routedRelations: arrows.map((arrow) => ({ relation: arrow, relationIndex: arrow.index, points: arrow.routePoints })),
     threshold: labelClearanceThreshold,
@@ -200,7 +483,8 @@ if (svgMatches.length === 1) {
   const desktopReadabilityIsError = qualityProfile === 'showcase';
   // Certain geometry, but new: surface it as evidence first (CONTRIBUTING.md#product-and-compatibility-contracts).
   const viewportHeightIsError = false;
-  const compositionErrors = (qualityGatesEnforced ? containerBorderRuns.length : 0)
+  const compositionErrors = (crossingAnalysis.exhausted ? 1 : 0)
+    + (qualityGatesEnforced ? containerBorderRuns.length : 0)
     + (crossingIsError ? relationshipCrossings.length : 0)
     + (corridorIsError ? ambiguousCorridors.length + arrowheadCollisions.length : 0)
     + (labelClearanceIsError ? labelRouteClearance.length : 0)
@@ -254,7 +538,7 @@ if (svgMatches.length === 1) {
       }),
       ...(crowdedSides.length ? { crowdedSides } : {}),
       detours: routedRelationships.flatMap((entry) => {
-        const metrics = routeBudgetMetrics({ routedRelations: [entry] });
+        const metrics = subpathBudgetMetrics([entry]);
         const blockers = directCorridorBlockers(entry.relation, nodeRects);
         return metrics.routesOverSuggestedBends || metrics.routesOverSuggestedStretch ? [{
           relationship: relationshipRecord(entry.relation),
@@ -266,6 +550,7 @@ if (svgMatches.length === 1) {
     },
     leadingSpace,
     ...(sequenceColumnSpace ? { sequenceColumnSpace } : {}),
+    ...(sequenceNoteBorders.length ? { sequenceNoteBorders } : {}),
     desktopReadability: desktopReadability.evidence,
     issues: [
       ...containerBorderRuns.map((hit) => ({
@@ -314,6 +599,17 @@ if (svgMatches.length === 1) {
         otherRelationship: relationshipRecord(hit.right),
         point: hit.point.map((value) => Math.round(value * 10) / 10),
       })),
+      ...(crossingAnalysis.exhausted ? [{
+        severity: 'error',
+        code: 'composition/crossing-analysis-budget',
+        attemptedPairs: crossingAnalysis.attemptedPairs,
+        attemptedSegmentPairs: crossingAnalysis.attemptedSegmentPairs,
+        pairLimit: maxCrossingPairChecks,
+        segmentPairLimit: maxCrossingSegmentPairChecks,
+        exhaustedBudget: crossingAnalysis.exhaustedBudget,
+        detail: crossingBudgetDetail(crossingAnalysis),
+        supportedFixes: crossingBudgetFixes(crossingAnalysis),
+      }] : []),
       ...ambiguousCorridors.map((hit) => ({
         severity: corridorIsError ? 'error' : 'warning',
         code: 'composition/ambiguous-corridor',
@@ -385,10 +681,10 @@ if (svgMatches.length === 1) {
   );
   addCheck(
     'relationship_crossings',
-    !crossingIsError || relationshipCrossings.length === 0,
-    relationshipCrossings.map((hit) => (
+    !crossingAnalysis.exhausted && (!crossingIsError || relationshipCrossings.length === 0),
+    [...relationshipCrossings.map((hit) => (
       `[composition/proper-crossing] ${qualityProfile} ${relationshipName(hit.left)} crosses ${relationshipName(hit.right)} at [${formatPoint(hit.point)}]`
-    )),
+    )), ...(crossingAnalysis.exhausted ? [`[composition/crossing-analysis-budget] ${crossingBudgetDetail(crossingAnalysis)}`] : [])],
   );
   addCheck(
     'relationship_corridors',
@@ -428,18 +724,26 @@ if (svgMatches.length === 1) {
   }
 }
 
+if (pathDiagnostics.length) addCheck('svg_path_data', false, pathDiagnostics.map(item => item.message));
+
 const ok = checks.every((check) => check.ok) && composition.status !== 'fail';
-console.log(JSON.stringify({ ok, file: htmlPath, artifact, checks, composition }, null, 2));
+console.log(JSON.stringify({ ok, file: htmlPath, artifact, checks, composition,
+  ...(pathDiagnostics.length ? { diagnostics: pathDiagnostics } : {}),
+}, null, 2));
 // Let pending stdout writes drain: large receipts are asynchronous when piped.
 process.exitCode = ok ? 0 : 1;
 
 function collectArrows(fragment, useActualPoints = false) {
   const arrows = [];
   let index = 0;
+  let pathIndex = 0;
   let previousTag = null;
   let previousTagEnd = 0;
 
-  for (const tag of fragment.matchAll(/<(path|line)\b[^>]*>/gi)) {
+  for (const tag of fragment.matchAll(SVG_TAG_TOKEN)) {
+    const name = tag[2]?.toLowerCase();
+    if (tag[1] || !['path', 'line'].includes(name)) continue;
+    if (name === 'path') pathIndex += 1;
     const tagStart = tag.index;
     const raw = tag[0];
     const gap = previousTag ? fragment.slice(previousTagEnd, tagStart) : '';
@@ -448,8 +752,8 @@ function collectArrows(fragment, useActualPoints = false) {
       && previousTag.name === 'path'
       && previousTag.underlayAttrs;
     previousTag = {
-      name: tag[1].toLowerCase(),
-      underlayAttrs: tag[1].toLowerCase() === 'path' && AUTOMATIC_CROSSOVER_UNDERLAY_TAG.test(raw)
+      name: name,
+      underlayAttrs: name === 'path' && AUTOMATIC_CROSSOVER_UNDERLAY_TAG.test(raw)
         ? parseAttrs(raw)
         : null,
     };
@@ -467,14 +771,19 @@ function collectArrows(fragment, useActualPoints = false) {
       && Number.isFinite(routeStrokeWidth)
       && Number.isFinite(underlayStrokeWidth)
       && underlayStrokeWidth >= routeStrokeWidth + 3;
-    const segments = tag[1].toLowerCase() === 'line'
-      ? lineSegments(attrs)
-      : pathSegments(attrs.d || '');
-    const borderSegments = tag[1].toLowerCase() === 'line'
-      ? segments
-      : straightPathSegments(attrs.d || '');
+    const line = name === 'line';
+    const parsed = line ? null : inspectedPath(attrs, tag.index, pathIndex, 'relationship');
+    const segments = line ? lineSegments(attrs) : parsed.subpaths.flatMap(part => part.segments);
+    const borderSegments = line ? segments : parsed.subpaths.flatMap(part => part.straightSegments);
+    let routeSubpaths = line ? continuousRoutePoints(segments)
+      : parsed.subpaths.flatMap(part => continuousRoutePoints(part.straightSegments));
+    // Legacy single-path metadata remains supported. It cannot bridge actual moveto boundaries.
+    if (!useActualPoints && (line || parsed.subpaths.length === 1)) {
+      const authoredPoints = parseRoutePoints(attrs['data-composition-points']);
+      if (authoredPoints) routeSubpaths = [authoredPoints];
+    }
     arrows.push({
-      kind: tag[1].toLowerCase(),
+      kind: name,
       index: index += 1,
       raw,
       // Trust route intent only for a semantic edge with one visible direct
@@ -482,21 +791,21 @@ function collectArrows(fragment, useActualPoints = false) {
       authoredStraight: attrs['data-composition-route'] === 'straight'
         && Boolean(attrs['data-edge-from'] && attrs['data-edge-to'])
         && segments.length === 1 && borderSegments.length === 1
-        && (tag[1].toLowerCase() === 'line' || /^\s*M\s+[-+\d.eE]+\s+[-+\d.eE]+\s+L\s+[-+\d.eE]+\s+[-+\d.eE]+\s*$/.test(attrs.d || '')),
+        && (name === 'line' || /^\s*M\s+[-+\d.eE]+\s+[-+\d.eE]+\s+L\s+[-+\d.eE]+\s+[-+\d.eE]+\s*$/.test(attrs.d || '')),
       crossoverHalo: verifiedCrossoverHalo,
       independentPorts: verifiedCrossoverHalo && attrs['data-composition-independent'] === 'true',
       // Compatibility with first-round exports lacking a root layout contract.
       // Readable-v2's root contract supersedes this narrower automatic-pair rule.
       // This marker never certifies a crossover halo or waives a quality rule.
       automaticWorkflowRoute: attrs['data-composition-routing'] === 'workflow-v2-auto',
+      junction: attrs['data-composition-junction'] || null,
       width: routeStrokeWidth,
       variant: raw.match(/\ba-(default|emphasis|security|dashed)\b/)?.[1] || 'default',
       role: attrs['data-edge-role'],
       segments,
       borderSegments,
-      routePoints: (!useActualPoints && parseRoutePoints(attrs['data-composition-points'])) || (
-        borderSegments.length ? [borderSegments[0].start, ...borderSegments.map((segment) => segment.end)] : []
-      ),
+      routePoints: routeSubpaths.length === 1 ? routeSubpaths[0] : [],
+      routeSubpaths,
       from: attrs['data-edge-from'] || attrs['data-composition-edge-from'],
       to: attrs['data-edge-to'] || attrs['data-composition-edge-to'],
       id: attrs['data-edge-id'] || attrs['data-composition-edge-id'],
@@ -507,6 +816,138 @@ function collectArrows(fragment, useActualPoints = false) {
   }
 
   return arrows;
+}
+
+function continuousRoutePoints(segments) {
+  const parts = [];
+  for (const { start, end } of segments) {
+    const previous = parts.at(-1);
+    // 非共线 Q 不参与直线预算；其两端也不能被拼接成一条虚构直线。
+    if (previous && previous.at(-1)[0] === start[0] && previous.at(-1)[1] === start[1]) {
+      previous.push(end);
+    } else {
+      parts.push([start, end]);
+    }
+  }
+  // 保留没有直线的子路径位置，避免把前一片段误认作语义终点。
+  return parts.length ? parts : [[]];
+}
+
+function inspectedPath(attrs, offset, pathIndex, role) {
+  if (pathAnalyses.has(offset)) return pathAnalyses.get(offset);
+  const result = analyzeSvgPath(decodeNumericReferences(attrs.d || ''));
+  if (result.ok) {
+    pathAnalyses.set(offset, result);
+    return result;
+  }
+  const { code, ...evidence } = result.error;
+  const id = attrs.id || attrs['data-edge-id'] || attrs['data-composition-frame-id'];
+  pathDiagnostics.push({
+    code,
+    severity: 'error',
+    message: `${role} path ${pathIndex}${id ? ` (${id})` : ''}: ${evidence.reason} at d offset ${evidence.tokenOffset}.`,
+    subject: { role, pathIndex, ...(id ? { id } : {}) },
+    evidence,
+    supportedFixes: [code === 'artifact/svg-path-unsupported'
+      ? 'regenerate the inspected relationship or frame using M/L/H/V/Q/Z commands'
+      : 'correct the path data at the reported offset or regenerate it from the original diagram'],
+  });
+  const invalid = { ok: false, subpaths: [] };
+  pathAnalyses.set(offset, invalid);
+  return invalid;
+}
+
+// Keep relationship identity separate from its disconnected drawing pieces.
+// Normalizing each piece also makes evidence segment indices stable across consumers.
+function routeParts(entry) {
+  const subpaths = entry.relation.routeSubpaths || [entry.points];
+  let segmentOffset = 0;
+  return subpaths.flatMap((points, subpathIndex) => {
+    const normalized = normalizeRoutePoints(points);
+    const part = { ...entry, points: normalized, segmentOffset,
+      sourceEndpoint: subpathIndex === 0, targetEndpoint: subpathIndex === subpaths.length - 1 };
+    segmentOffset += Math.max(0, normalized.length - 1);
+    return normalized.length > 1 ? [part] : [];
+  });
+}
+
+function subpathBudgetMetrics(entries) {
+  if (entries.every(entry => entry.relation.routeSubpaths.length <= 1)) {
+    return routeBudgetMetrics({ routedRelations: entries });
+  }
+  const total = routeBudgetMetrics({ routedRelations: [] });
+  for (const entry of entries) {
+    const parts = routeParts(entry);
+    const metrics = routeBudgetMetrics({ routedRelations: parts });
+    metrics.maxBends = parts.reduce((sum, part) => sum + Math.max(0, part.points.length - 2), 0);
+    // A relationship may exceed a budget in several pieces; count its identity once.
+    metrics.routesOverSuggestedBends = Number(metrics.maxBends > 2);
+    metrics.routesOverSuggestedStretch = Number(metrics.routesOverSuggestedStretch > 0);
+    for (const [key, value] of Object.entries(metrics)) {
+      if (key.startsWith('max')) total[key] = value == null ? total[key] : Math.max(total[key] ?? value, value);
+      else if (key.startsWith('min')) total[key] = value == null ? total[key] : Math.min(total[key] ?? value, value);
+      else total[key] += value;
+    }
+  }
+  return total;
+}
+
+function subpathRhythmIssues(entries) {
+  return entries.flatMap(entry => routeParts(entry).flatMap(part => (
+    collectRouteRhythmIssues({ routedRelations: [part] }).map(issue => ({
+      ...issue, segmentIndex: issue.segmentIndex + part.segmentOffset,
+    }))
+  )));
+}
+
+function subpathCorridors({ routedRelations, ...options }) {
+  if (routedRelations.every(entry => entry.relation.routeSubpaths.length <= 1)) {
+    return collectAmbiguousCorridors({ routedRelations, ...options });
+  }
+  const hits = [];
+  const parts = routedRelations.map(routeParts);
+  for (let left = 0; left < parts.length; left += 1) {
+    for (let right = left + 1; right < parts.length; right += 1) {
+      let longest;
+      for (const a of parts[left]) for (const b of parts[right]) {
+        const hit = collectAmbiguousCorridors({ routedRelations: [a, b], ...options })[0];
+        if (hit && (!longest || hit.overlapLength > longest.overlapLength + 0.0001)) {
+          longest = { ...hit, leftSegment: hit.leftSegment + a.segmentOffset,
+            rightSegment: hit.rightSegment + b.segmentOffset };
+        }
+      }
+      if (longest) hits.push(longest);
+    }
+  }
+  return hits;
+}
+
+function subpathLabelClearance({ routedRelations, labels, threshold }) {
+  if (routedRelations.every(entry => entry.relation.routeSubpaths.length <= 1)) {
+    return collectLabelRouteClearance({ routedRelations, labels, threshold });
+  }
+  // The shared helper deduplicates by relationship identity. Measure each piece
+  // independently, then preserve one nearest hit per label/relationship pair.
+  const hits = [];
+  const seen = new Set();
+  for (const entry of routedRelations) {
+    const relation = entry.relation;
+    const identity = relation.key !== undefined ? `key:${relation.key}`
+      : relation.id ? `id:${relation.from || ''}\0${relation.to || ''}\0${relation.id}` : `index:${entry.relationIndex}`;
+    if (seen.has(identity) || !routeParts(entry).length) continue;
+    seen.add(identity);
+    const nearest = new Map();
+    for (const part of routeParts(entry)) {
+      for (const hit of collectLabelRouteClearance({ routedRelations: [part], labels, threshold })) {
+        const current = nearest.get(hit.labelRelationIndex);
+        if (!current || hit.clearance < current.clearance) nearest.set(hit.labelRelationIndex, {
+          ...hit, segmentIndex: hit.segmentIndex + part.segmentOffset,
+        });
+      }
+    }
+    hits.push(...nearest.values());
+  }
+  return hits;
 }
 
 function collectRelationshipLabelMasks(fragment, arrows) {
@@ -575,14 +1016,21 @@ function parseRoutePoints(value) {
   return points.length >= 2 && points.every(isPoint) ? points : null;
 }
 
-function collectRelationshipCrossings(arrows, includeSharedEndpoints = false) {
-  const relationships = arrows.filter((arrow) => arrow.from && arrow.to && arrow.segments.length).map(arrow => ({
+function collectRelationshipCrossings(
+  arrows,
+  includeSharedEndpoints = false,
+  pairLimit = DEFAULT_MAX_CROSSING_PAIR_CHECKS,
+  segmentPairLimit = DEFAULT_MAX_CROSSING_SEGMENT_PAIR_CHECKS,
+) {
+  const relationships = arrows.filter((arrow) => arrow.from && arrow.to).map(arrow => ({
     ...arrow,
     // Readable-v2 routePoints come from the visible path, never its metadata.
     // A straight-through via is not a visual endpoint; preserve real bends.
-    segments: includeSharedEndpoints ? forwardCollinearAnalysisSegments(arrow.routePoints) : arrow.segments,
-  }));
+    segments: includeSharedEndpoints ? arrow.routeSubpaths.flatMap(forwardCollinearAnalysisSegments) : arrow.segments,
+  })).filter((arrow) => arrow.segments.length);
   const crossings = [];
+  let attemptedPairs = 0;
+  let attemptedSegmentPairs = 0;
   for (let leftIndex = 0; leftIndex < relationships.length; leftIndex += 1) {
     const left = relationships[leftIndex];
     for (let rightIndex = leftIndex + 1; rightIndex < relationships.length; rightIndex += 1) {
@@ -593,9 +1041,17 @@ function collectRelationshipCrossings(arrows, includeSharedEndpoints = false) {
           && !includeSharedEndpoints
           && !(left.independentPorts && right.independentPorts)
           && !(left.automaticWorkflowRoute && right.automaticWorkflowRoute)) continue;
+      if (attemptedPairs >= pairLimit) {
+        return { crossings, attemptedPairs, attemptedSegmentPairs, exhausted: true, exhaustedBudget: 'relationship-pairs' };
+      }
+      attemptedPairs += 1;
       let point = null;
       for (const leftSegment of left.segments) {
         for (const rightSegment of right.segments) {
+          if (attemptedSegmentPairs >= segmentPairLimit) {
+            return { crossings, attemptedPairs, attemptedSegmentPairs, exhausted: true, exhaustedBudget: 'segment-pairs' };
+          }
+          attemptedSegmentPairs += 1;
           point = properSegmentIntersection(leftSegment.start, leftSegment.end, rightSegment.start, rightSegment.end);
           if (point) break;
         }
@@ -604,7 +1060,26 @@ function collectRelationshipCrossings(arrows, includeSharedEndpoints = false) {
       if (point) crossings.push({ left, right, point });
     }
   }
-  return crossings;
+  return { crossings, attemptedPairs, attemptedSegmentPairs, exhausted: false, exhaustedBudget: null };
+}
+
+function crossingBudgetDetail(analysis) {
+  const attempted = analysis.exhaustedBudget === 'segment-pairs'
+    ? `${analysis.attemptedSegmentPairs} segment pairs (limit ${maxCrossingSegmentPairChecks}) after ${analysis.attemptedPairs} relationship pairs`
+    : `${analysis.attemptedPairs} relationship pairs (limit ${maxCrossingPairChecks}) after ${analysis.attemptedSegmentPairs} segment pairs`;
+  return `Crossing analysis stopped after ${attempted}; inspection is incomplete.`;
+}
+
+function crossingBudgetFixes(analysis) {
+  return analysis.exhaustedBudget === 'segment-pairs'
+    ? ['increase ARCHIFY_CHECK_MAX_CROSSING_SEGMENT_PAIR_CHECKS for this known-large artifact and rerun the check']
+    : ['increase ARCHIFY_CHECK_MAX_CROSSING_PAIR_CHECKS for this known-large artifact and rerun the check'];
+}
+
+function positiveIntegerEnvironment(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined || value === '') return fallback;
+  return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : fallback;
 }
 
 function relationshipName(arrow) {
@@ -702,12 +1177,16 @@ function relationshipRecord(arrow) {
 
 function collectCompositionFrames(fragment) {
   const frames = [];
-  for (const match of fragment.matchAll(/<(rect|path|line)\b[^>]*>/gi)) {
+  let pathIndex = 0;
+  for (const match of fragment.matchAll(SVG_TAG_TOKEN)) {
+    const name = match[2]?.toLowerCase();
+    if (match[1] || !['rect', 'path', 'line'].includes(name)) continue;
+    if (name === 'path') pathIndex += 1;
     const attrs = parseAttrs(match[0]);
     const kind = attrs['data-composition-frame-kind'];
     if (!kind) continue;
     const identity = attrs['data-composition-frame-id'] || frames.length;
-    if (match[1].toLowerCase() === 'rect') {
+    if (name === 'rect') {
       const frame = {
         kind,
         id: identity,
@@ -720,9 +1199,9 @@ function collectCompositionFrames(fragment) {
       if ([frame.x, frame.y, frame.width, frame.height].every(Number.isFinite)) frames.push(frame);
       continue;
     }
-    const segments = match[1].toLowerCase() === 'line'
+    const segments = name === 'line'
       ? lineSegments(attrs)
-      : pathSegments(attrs.d || '');
+      : inspectedPath(attrs, match.index, pathIndex, 'structural-frame').subpaths.flatMap(part => part.segments);
     for (const [segmentIndex, segment] of segments.entries()) {
       frames.push({
         kind,
@@ -751,7 +1230,7 @@ function collectArchitectureLeadingSpace({ svgAttrs, fragment, nodeRects, frames
   const nodeCount = [...fragment.matchAll(/<g\b[^>]*\bdata-node-id=/gi)].length;
   if (!nodeRects.length || nodeRects.length !== nodeCount) return evidence;
   const semanticArrows = arrows.filter((arrow) => arrow.from && arrow.to);
-  if (semanticArrows.some((arrow) => !arrow.routePoints.length)) return evidence;
+  if (semanticArrows.some((arrow) => !arrow.routeSubpaths.some(points => points.length))) return evidence;
 
   const occupied = nodeRects.map((node) => node.box[1]);
   for (const frame of frames) {
@@ -768,7 +1247,7 @@ function collectArchitectureLeadingSpace({ svgAttrs, fragment, nodeRects, frames
     occupied.push(y);
   }
   for (const arrow of semanticArrows) {
-    for (const point of arrow.routePoints) occupied.push(point[1]);
+    for (const points of arrow.routeSubpaths) for (const point of points) occupied.push(point[1]);
   }
   for (const label of labels) occupied.push(label.rect.y);
   if (!occupied.every(Number.isFinite)) return evidence;
@@ -796,7 +1275,7 @@ function collectSequenceColumnSpace({ svgAttrs, fragment, nodeRects, arrows }) {
   const columnFit = svgAttrs['data-sequence-column-fit'];
   if (!['fixed', 'spread'].includes(columnFit)) return null;
   const evidence = { measured: false, reviewSuggested: false, columnFit };
-  if (svgAttrs.transform || /<tspan\b/i.test(fragment)) return evidence;
+  if (svgAttrs.transform) return evidence;
   // Brand badges stay inside their participant box. Ignore only that subtree's
   // transforms, including the preset path or nested fallback icon's scale.
   const brandGroups = [];
@@ -820,10 +1299,10 @@ function collectSequenceColumnSpace({ svgAttrs, fragment, nodeRects, arrows }) {
   const nodeCount = [...fragment.matchAll(/<g\b[^>]*\bdata-node-id=/gi)].length;
   if (!nodeRects.length || nodeCount !== nodeRects.length) return evidence;
   const semanticArrows = arrows.filter((arrow) => arrow.from && arrow.to);
-  if (semanticArrows.some((arrow) => !arrow.routePoints.length)) return evidence;
+  if (semanticArrows.some((arrow) => !arrow.routeSubpaths.some(points => points.length))) return evidence;
   const rightEdges = nodeRects.map((node) => node.box[0] + node.box[2]);
   for (const arrow of semanticArrows) {
-    for (const point of arrow.routePoints) rightEdges.push(point[0]);
+    for (const points of arrow.routeSubpaths) for (const point of points) rightEdges.push(point[0]);
   }
   // Label plates, activations and segment titles also reserve horizontal room.
   for (const match of fragment.matchAll(/<rect\b[^>]*>/gi)) {
@@ -832,9 +1311,19 @@ function collectSequenceColumnSpace({ svgAttrs, fragment, nodeRects, arrows }) {
     rightEdges.push(numberAttr(attrs, 'x') + numberAttr(attrs, 'width'));
   }
   for (const match of fragment.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi)) {
-    const box = textBox(parseAttrs(match[1]), stripTags(match[2]).trim());
-    if (!box) return evidence;
-    rightEdges.push(box.x2);
+    const attrs = parseAttrs(match[1]);
+    // A wrapped note places each line in a <tspan> with its own x. Any other
+    // line offset is not measured here.
+    const lines = /<tspan\b/i.test(match[2])
+      ? [...match[2].matchAll(/<tspan\b([^>]*)>([\s\S]*?)<\/tspan>/gi)]
+        .map((line) => ({ attrs: { ...attrs, ...parseAttrs(line[1]) }, text: stripTags(line[2]).trim() }))
+      : [{ attrs, text: stripTags(match[2]).trim() }];
+    if (!lines.length || lines.some((line) => line.attrs.dx !== undefined)) return evidence;
+    for (const line of lines) {
+      const box = textBox(line.attrs, line.text);
+      if (!box) return evidence;
+      rightEdges.push(box.x2);
+    }
   }
   if (!rightEdges.every(Number.isFinite)) return evidence;
   const occupiedRight = Math.max(...rightEdges);
@@ -859,6 +1348,74 @@ function collectSequenceColumnSpace({ svgAttrs, fragment, nodeRects, arrows }) {
   };
 }
 
+// Sequence notes are direct text children of a semantic message group; message
+// labels use a nested group. Inspect the emitted lines without changing layout.
+// This is advisory: phase ownership still belongs to the author.
+function collectSequenceNoteBorders({ svgAttrs, fragment, frames, arrows }) {
+  if (!svgAttrs['data-sequence-column-fit'] || svgAttrs.transform) return [];
+  const segments = frames.filter(frame => frame.kind === 'segment' && !frame.shape);
+  if (!segments.length) return [];
+  const issues = [], stack = [];
+  for (const tag of fragment.matchAll(SVG_TAG_TOKEN)) {
+    const name = tag[2]?.toLowerCase();
+    if (name === 'g') {
+      if (tag[1]) stack.pop();
+      else if (!tag[0].endsWith('/>')) stack.push(parseAttrs(tag[0]));
+      continue;
+    }
+    if (name === 'rect' && !tag[1]) {
+      const attrs = parseAttrs(tag[0]);
+      if (attrs['data-composition-frame-kind'] === 'segment' && (attrs.transform || stack.some(group => group.transform))) return [];
+    }
+    if (name !== 'text' || tag[1] || stack.some(attrs => attrs.transform)) continue;
+    const owner = stack.at(-1), attrs = parseAttrs(tag[0]);
+    if (!owner?.['data-edge-key'] || !['context', 'fine'].includes(attrs['data-detail']) || attrs.transform || attrs.rotate || attrs.dx || attrs.dy) continue;
+    const index = Number(owner['data-edge-key']);
+    if (!Number.isSafeInteger(index) || index < 0) continue;
+    const arrow = arrows[index], arrowY = arrow?.routePoints?.[0]?.[1];
+    if (!Number.isFinite(arrowY)) continue;
+    const end = fragment.indexOf('</text>', tag.index + tag[0].length);
+    if (end < 0) continue;
+    const content = fragment.slice(tag.index + tag[0].length, end);
+    let baseline = numberAttr(attrs, 'y');
+    const boxes = [];
+    const spans = [...content.matchAll(/<tspan\b([^>]*)>([\s\S]*?)<\/tspan>/gi)];
+    let supported = true;
+    for (const span of spans.length ? spans : [[null, '', content]]) {
+      const line = parseAttrs(span[1]);
+      if (line.y !== undefined || line.dx !== undefined || line.rotate !== undefined || line.transform !== undefined) { supported = false; break; }
+      baseline += Number(line.dy || 0);
+      const box = textBox({ ...attrs, ...line, y: String(baseline) }, stripTags(span[2]));
+      if (!box || ![box.x1, box.x2, box.y1, box.y2].every(Number.isFinite)) { supported = false; break; }
+      boxes.push(box);
+    }
+    if (!supported || !boxes.length) continue;
+    const note = { x: Math.min(...boxes.map(b => b.x1)), y: Math.min(...boxes.map(b => b.y1)) };
+    note.width = Math.max(...boxes.map(b => b.x2)) - note.x;
+    note.height = Math.max(...boxes.map(b => b.y2)) - note.y;
+    const bottom = note.y + note.height;
+    for (const frame of segments) {
+      const border = frame.y + frame.height;
+      if (!(arrowY >= frame.y && arrowY < border && note.y < border && bottom > border + 0.5)) continue;
+      const requiredTo = Math.ceil(bottom + 4);
+      // A single-field fix may not swallow another message or stage, or push
+      // the frame beyond an authored canvas. Otherwise ask for a joint review.
+      const safe = /^\d+$/.test(String(frame.id)) && requiredTo <= viewBoxRect(svgAttrs)[1] + viewBoxRect(svgAttrs)[3] - 45
+        && !arrows.some(other => other.routePoints.some(point => point[1] > border - 4 && point[1] < requiredTo + 4))
+        && !segments.some(other => other !== frame && other.y < requiredTo && other.y + other.height > border);
+      const segmentPath = `/segments/${frame.id}/to`;
+      issues.push({
+        code: 'sequence/note-segment-border', reviewSuggested: true,
+        message: `Note on message "${owner['data-edge-label'] || owner['data-edge-id'] || index}" ends at y=${Math.ceil(bottom)}, crossing its segment bottom y=${border}. ${safe ? `Set ${segmentPath} to ${requiredTo} to keep the full note inside.` : 'Review the note and neighbouring phase boundaries together; keep the full note and message order.'}`,
+        subject: { diagramType: 'sequence', path: `/messages/${index}/note` },
+        evidence: { note, lines: boxes.length, messageY: arrowY, segment: { path: segmentPath, from: frame.y, to: border }, requiredTo },
+        supportedFixes: safe ? [`set ${segmentPath} to ${requiredTo}`] : [],
+      });
+    }
+  }
+  return issues;
+}
+
 function frameName(frame) {
   return `${frame.kind || 'frame'} "${frame.id}"`;
 }
@@ -876,88 +1433,6 @@ function lineSegments(attrs) {
   const end = [numberAttr(attrs, 'x2'), numberAttr(attrs, 'y2')];
   if (!isPoint(start) || !isPoint(end)) return [];
   return [{ start, end }];
-}
-
-function pathSegments(d) {
-  const points = pointsFromPath(d);
-  const segments = [];
-  for (let i = 1; i < points.length; i += 1) {
-    segments.push({ start: points[i - 1], end: points[i] });
-  }
-  return segments;
-}
-
-// Border runs use exact visible primitives. Non-collinear Q curves are never
-// flattened into chords here: a tangent or sampled near-horizontal curve is
-// not a structural border run. A fully collinear Q remains a straight visible
-// primitive and is included.
-function straightPathSegments(d) {
-  const tokens = d.match(/[MLHVQZmlhvqz]|[-+]?(?:\d*\.)?\d+(?:e[-+]?\d+)?/g) || [];
-  const segments = [];
-  let i = 0;
-  let command = '';
-  let current = [0, 0];
-  let start = null;
-  while (i < tokens.length) {
-    if (isCommand(tokens[i])) command = tokens[i++];
-    if (!command) break;
-    const absolute = command === command.toUpperCase();
-    switch (command.toUpperCase()) {
-      case 'M':
-      case 'L': {
-        let first = true;
-        while (i + 1 < tokens.length && !isCommand(tokens[i])) {
-          const point = [Number.parseFloat(tokens[i++]), Number.parseFloat(tokens[i++])];
-          if (!point.every(Number.isFinite)) break;
-          const next = absolute ? point : [current[0] + point[0], current[1] + point[1]];
-          if (command.toUpperCase() === 'L' || !first) segments.push({ start: current, end: next });
-          current = next;
-          if (!start) start = current;
-          first = false;
-        }
-        break;
-      }
-      case 'H': {
-        while (i < tokens.length && !isCommand(tokens[i])) {
-          const value = Number.parseFloat(tokens[i++]);
-          if (!Number.isFinite(value)) break;
-          const next = [absolute ? value : current[0] + value, current[1]];
-          segments.push({ start: current, end: next });
-          current = next;
-        }
-        break;
-      }
-      case 'V': {
-        while (i < tokens.length && !isCommand(tokens[i])) {
-          const value = Number.parseFloat(tokens[i++]);
-          if (!Number.isFinite(value)) break;
-          const next = [current[0], absolute ? value : current[1] + value];
-          segments.push({ start: current, end: next });
-          current = next;
-        }
-        break;
-      }
-      case 'Q': {
-        while (i + 3 < tokens.length && !isCommand(tokens[i])) {
-          const values = [0, 0, 0, 0].map(() => Number.parseFloat(tokens[i++]));
-          if (!values.every(Number.isFinite)) break;
-          const control = absolute ? values.slice(0, 2) : [current[0] + values[0], current[1] + values[1]];
-          const end = absolute ? values.slice(2, 4) : [current[0] + values[2], current[1] + values[3]];
-          if (Math.abs(crossProduct(current, control, end)) <= 1e-9) segments.push({ start: current, end });
-          current = end;
-        }
-        break;
-      }
-      case 'Z':
-        if (start) segments.push({ start: current, end: start });
-        current = start || current;
-        command = '';
-        break;
-      default:
-        return [];
-    }
-  }
-  return segments.filter(({ start: a, end: b }) => isPoint(a) && isPoint(b));
 }
 
 function diagonalStraightSegments(arrow) {
@@ -985,7 +1460,7 @@ function collectLegendBoxes(fragment) {
 
   for (const match of fragment.matchAll(/<text\b([^>]*)>([\s\S]*?)<\/text>/gi)) {
     const attrs = parseAttrs(match[1]);
-    const box = textBox(attrs, stripTags(match[2]).trim());
+    const box = textBox(attrs, stripTags(match[2]).trim(), legendTextWidth);
     if (box) boxes.push(box);
   }
 
@@ -1006,12 +1481,20 @@ function collectLegendCollisions(arrows, boxes) {
   return collisions;
 }
 
-function textBox(attrs, text) {
+// The footprint a legend entry reserves is the renderer's own: textUnits() at
+// TEXT_ADVANCE_EM (renderers/shared/legend.mjs). The default estimate below stays
+// as it is for the readability projection, which is deliberately conservative.
+function legendTextWidth(text, fontSize) {
+  const TEXT_ADVANCE_EM = 0.62;
+  return Math.max(fontSize, textUnits(text) * fontSize * TEXT_ADVANCE_EM);
+}
+
+function textBox(attrs, text, measure = estimatedTextWidth) {
   const x = numberAttr(attrs, 'x');
   const y = numberAttr(attrs, 'y');
   const fontSize = Number.parseFloat(attrs['font-size'] || '10');
   if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(fontSize)) return null;
-  const width = estimatedTextWidth(text, fontSize);
+  const width = measure(text, fontSize);
   const anchor = attrs['text-anchor'] || 'start';
   let x1 = x;
   if (anchor === 'middle') x1 = x - width / 2;
@@ -1099,7 +1582,7 @@ function collectDesktopReadability(svgAttrs, fragment, contract) {
   }
   const minimumSourceTextPx = entries.length ? Math.min(...entries.map((entry) => entry.sourceFontPx)) : Number.NaN;
   const eligible = contract === DECLARED_WIDE_READER_CONTRACT
-    && svgAttrs['data-reader-fit'] === 'intrinsic-height'
+    && ['intrinsic-height', 'width-first'].includes(svgAttrs['data-reader-fit'])
     && Number.isFinite(requestedMinimumTextPx) && requestedMinimumTextPx > 0
     && !invalidSemanticText && entries.length > 0;
   const declared = eligible ? declaredWideReadabilityBudget({
@@ -1153,88 +1636,6 @@ function estimatedTextWidth(text, fontSize) {
   let units = 0;
   for (const char of text) units += char.charCodeAt(0) > 255 ? 1.8 : 0.62;
   return Math.max(fontSize, units * fontSize);
-}
-
-function pointsFromPath(d) {
-  const tokens = d.match(/[MLHVQZmlhvqz]|[-+]?(?:\d*\.)?\d+(?:e[-+]?\d+)?/g) || [];
-  const points = [];
-  let i = 0;
-  let command = '';
-  let current = [0, 0];
-  let start = null;
-
-  while (i < tokens.length) {
-    if (isCommand(tokens[i])) command = tokens[i++];
-    if (!command) break;
-
-    const absolute = command === command.toUpperCase();
-    switch (command.toUpperCase()) {
-      case 'M':
-      case 'L': {
-        while (i + 1 < tokens.length && !isCommand(tokens[i])) {
-          const x = Number.parseFloat(tokens[i++]);
-          const y = Number.parseFloat(tokens[i++]);
-          if (!Number.isFinite(x) || !Number.isFinite(y)) break;
-          current = absolute ? [x, y] : [current[0] + x, current[1] + y];
-          points.push(current);
-          if (!start) start = current;
-        }
-        break;
-      }
-      case 'H': {
-        while (i < tokens.length && !isCommand(tokens[i])) {
-          const x = Number.parseFloat(tokens[i++]);
-          if (!Number.isFinite(x)) break;
-          current = absolute ? [x, current[1]] : [current[0] + x, current[1]];
-          points.push(current);
-        }
-        break;
-      }
-      case 'V': {
-        while (i < tokens.length && !isCommand(tokens[i])) {
-          const y = Number.parseFloat(tokens[i++]);
-          if (!Number.isFinite(y)) break;
-          current = absolute ? [current[0], y] : [current[0], current[1] + y];
-          points.push(current);
-        }
-        break;
-      }
-      case 'Q': {
-        while (i + 3 < tokens.length && !isCommand(tokens[i])) {
-          const controlX = Number.parseFloat(tokens[i++]);
-          const controlY = Number.parseFloat(tokens[i++]);
-          const endX = Number.parseFloat(tokens[i++]);
-          const endY = Number.parseFloat(tokens[i++]);
-          if (![controlX, controlY, endX, endY].every(Number.isFinite)) break;
-          const control = absolute
-            ? [controlX, controlY]
-            : [current[0] + controlX, current[1] + controlY];
-          const end = absolute
-            ? [endX, endY]
-            : [current[0] + endX, current[1] + endY];
-          const startPoint = current;
-          for (let step = 1; step <= 8; step += 1) {
-            const amount = step / 8;
-            const remaining = 1 - amount;
-            points.push([
-              remaining * remaining * startPoint[0] + 2 * remaining * amount * control[0] + amount * amount * end[0],
-              remaining * remaining * startPoint[1] + 2 * remaining * amount * control[1] + amount * amount * end[1],
-            ]);
-          }
-          current = end;
-        }
-        break;
-      }
-      case 'Z': {
-        if (start) points.push(start);
-        break;
-      }
-      default:
-        return [];
-    }
-  }
-
-  return points.filter(isPoint);
 }
 
 function properSegmentIntersection(a, b, c, d) {
@@ -1337,7 +1738,9 @@ function collectNonFiniteAttrs(svg) {
     }
     // HTML void elements do not open a context; SVG self-closing tags do not
     // either. A nested <svg> inside foreignObject restores SVG checking.
-    if (!(inSvg ? /\/\s*>$/.test(match[0]) : HTML_VOID_ELEMENTS.has(element))) {
+    // The self-closing test is attribute-aware: a '/' ending an unquoted
+    // attribute value is value text, not the self-closing flag.
+    if (!(inSvg ? isSelfClosingTag(match[0]) : HTML_VOID_ELEMENTS.has(element))) {
       stack.push({ element, inSvg });
     }
   }
@@ -1373,10 +1776,6 @@ function parseAttrs(tag) {
 
 function numberAttr(attrs, name) {
   return Number.parseFloat(attrs[name]);
-}
-
-function isCommand(token) {
-  return /^[A-Za-z]$/.test(token);
 }
 
 function isPoint(point) {

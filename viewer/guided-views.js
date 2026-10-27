@@ -1089,7 +1089,7 @@
 
       function storyGeometry(edge) {
         if (/^(path|line|polyline)$/i.test(edge.tagName)) return [edge];
-        return Array.prototype.slice.call(edge.querySelectorAll('path, line, polyline'));
+        return Array.prototype.slice.call(edge.querySelectorAll('path:not([data-ambient-flow-overlay]), line, polyline'));
       }
 
       function renderStoryTrail(view) {
@@ -1545,6 +1545,7 @@
         clearChapterPreviewIntent('focus', chapterButtons.indexOf(button));
       });
       chapterList.addEventListener('keydown', function (event) {
+        if (event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return;
         var button = event.target.closest('[data-guided-view-id]');
         var index = chapterButtons.indexOf(button);
         if (index < 0) return;
@@ -1572,6 +1573,7 @@
       }, true);
 
       document.addEventListener('keydown', function (event) {
+        if (event.isComposing || event.keyCode === 229) return;
         if (event.metaKey || event.ctrlKey || event.altKey) return;
         if (document.documentElement.getAttribute('data-guide-open') === 'true') return;
         var target = event.target;

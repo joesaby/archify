@@ -7,16 +7,18 @@ import { canonicalFuturePath, pathsAlias, resolveNativeOutputDirectory, resolveO
 import { boundedSidecarStem } from '../renderers/shared/sidecar-path.mjs';
 import {
   captureAtomicOutput, captureRegularFileBinding, publishRegularFileBinding,
-  releaseRegularFileBinding, removeOwnedRegularFile, verifyAtomicOutput,
+  releaseRegularFileBinding, removeOwnedRegularFile, quarantineRemoveRegularFileBinding, verifyAtomicOutput,
 } from '../renderers/shared/atomic-output.mjs';
 import {
   browserCheckSidecarPaths,
   CAPTURE_VIEWPORTS,
   ChromeVisualBrowser,
   findChrome,
+  persistBrowserCheckFailure,
   VISUAL_CHECK_VIEWPORTS,
 } from './visual-check.mjs';
 import { startDeliveryUpdateCheck } from './delivery-update.mjs';
+import { declaredExplainerInputPaths } from '../explainer/prepare.mjs';
 
 export const FINALIZE_STAGES = Object.freeze(['validate', 'deliver', 'check', 'browser-check']);
 const FINALIZE_UPDATE_DEADLINE_MS = 4_000;
@@ -144,6 +146,17 @@ function exactViewportCoverage(entries, viewports, predicate) {
 }
 
 function validBrowserEvidence(receipt) {
+  if (receipt.family === 'explainer') {
+    const viewports = [1280, 1440].flatMap(width => ['light', 'dark'].map(theme => ({ width, height: 900, theme })));
+    const groups = ['containment', 'readability', 'viewerChrome', 'themeStates'];
+    return receipt.viewportPolicy === 'explainer-desktop-v1'
+      && groups.every(group => receipt[group]?.status === 'pass'
+        && exactViewportCoverage(receipt[group].viewports?.map(entry => ({ ...entry, requestedTheme: entry.requestedTheme || entry.theme })), viewports, (entry, expected) =>
+          entry.ok === true && (entry.requestedTheme || entry.theme) === expected.theme))
+      && ['commonQa', 'interactions', 'references', 'noJavaScript', 'print'].every(group =>
+        receipt[group]?.status === 'pass' && Array.isArray(receipt[group].observations) && receipt[group].observations.length > 0
+        && receipt[group].observations.every(entry => entry.ok === true));
+  }
   return exactViewportCoverage(receipt.containment?.viewports, VISUAL_CHECK_VIEWPORTS, (entry) => (
     entry.theme === 'light' && entry.ok === true
   ))
@@ -290,6 +303,10 @@ function stageBindingDiagnostic({ stage, receipt, expectedArtifact, expectedRece
     }
     return null;
   }
+  if (stage === 'browser-check' && ((type === 'explainer') !== (receipt.family === 'explainer'))) {
+    return { code: 'finalize/browser-family-mismatch', severity: 'error', message: 'Browser evidence covers a different artifact family.',
+      subject: {stage, artifact: output}, evidence: {expectedType:type, actualFamily:receipt.family}, supportedFixes:['Rerun browser-check for the delivered artifact.'] };
+  }
   if (stage === 'check' && deliveryValidation?.checkCount !== receipt.checks.length) {
     return {
       code: 'finalize/delivery-validation-mismatch',
@@ -370,6 +387,62 @@ function stageStatus(stage, exitCode, receipt, quality) {
   return exitCode === 0 && validStageReceipt(stage, receipt, quality) ? 'pass' : 'fail';
 }
 
+function consolidateDiagnostics(diagnostics) {
+  const result = [];
+  const seen = new Set();
+  const overflow = [];
+  let overflowIndex = -1;
+  for (const diagnostic of diagnostics || []) {
+    if (diagnostic?.code === 'viewer/viewport-overflow') {
+      if (overflowIndex < 0) overflowIndex = result.length;
+      overflow.push(diagnostic);
+      continue;
+    }
+    const key = `${diagnostic?.code}${diagnostic?.message}${JSON.stringify(diagnostic?.subject ?? null)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(diagnostic);
+  }
+  const slimEvidence = (evidence) => {
+    if (!evidence || typeof evidence !== 'object') return evidence;
+    const { innerWidth: _w, innerHeight: _h, readerLayout: _l, readerOverflow: _o, readerFit: _f, ...rest } = evidence;
+    return rest;
+  };
+  if (overflow.length > 1) {
+    const first = overflow[0];
+    const tightest = overflow
+      .map((entry) => entry.subject?.viewport)
+      .filter(Boolean)
+      .sort((a, b) => a.width * a.height - b.width * b.height)[0];
+    const fixes = tightest
+      ? [`contain the rendered layout within ${tightest.width}x${tightest.height} (smallest reported viewport), then rerun browser-check`]
+      : [...new Set(overflow.flatMap((entry) => entry.supportedFixes || []))];
+    result.splice(overflowIndex, 0, {
+      ...first,
+      message: `The rendered artifact overflows ${overflow.length} viewport/theme combinations.`,
+      subject: { diagramType: first.subject?.diagramType },
+      supportedFixes: fixes,
+      evidence: {
+        overflows: overflow.map((entry) => {
+          const { artifact: _artifact, ...subject } = entry.subject || {};
+          return {
+            // Predicted validate-stage overflow carries estimatedTextWidthPx;
+            // the browser-check measurement carries scroll* geometry instead.
+            detection: entry.evidence?.estimatedTextWidthPx != null ? 'validate-prediction' : 'browser-measurement',
+            subject,
+            evidence: slimEvidence(entry.evidence),
+          };
+        }),
+      },
+    });
+  } else if (overflow.length === 1) {
+    const [entry] = overflow;
+    const { artifact: _artifact, ...subject } = entry.subject || {};
+    result.splice(overflowIndex, 0, { ...entry, subject, evidence: slimEvidence(entry.evidence) });
+  }
+  return result;
+}
+
 function failureDiagnostics(stage, result, receipt, quality) {
   if (Array.isArray(receipt?.diagnostics) && receipt.diagnostics.length) return receipt.diagnostics;
   const invalidReceipt = (result.status ?? 1) === 0 && !validStageReceipt(stage, receipt, quality);
@@ -408,9 +481,27 @@ function browserEvidence(receipt, artifactPath) {
   };
 }
 
+// Stage receipts (dense validate/check JSON) can exceed execFile's 1 MiB
+// default. Track ARCHIFY_CHECK_MAX_BUFFER so a raised checker limit is not
+// defeated one layer up, with a 4 MiB floor: a lowered knob makes failing
+// stages emit compact classified receipts, but those receipts — and any
+// successful receipt the knob let through — still have to fit the capture.
+// The 64 KiB headroom covers the stage echo over the raw checker receipt:
+// commandCheck appends provenance and deliveryReceiptId after the checker
+// ran, so the printed receipt can exceed the knob that admitted it. Read the
+// knob from the runner's env, not process.env: runFinalize callers supply
+// their own env and the child stages inherit exactly that object.
+function stageCaptureMaxBuffer(env = process.env) {
+  const parsed = Number(env.ARCHIFY_CHECK_MAX_BUFFER);
+  const knob = Number.isFinite(parsed) && Math.floor(parsed) >= 1
+    ? Math.floor(parsed)
+    : 64 * 1024 * 1024;
+  return Math.max(knob, 4 * 1024 * 1024) + 64 * 1024;
+}
+
 function defaultRunner({ cliPath, args, cwd, env }) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [cliPath, ...args], { cwd, env, encoding: 'utf8' }, (error, stdout, stderr) => {
+    execFile(process.execPath, [cliPath, ...args], { cwd, env, encoding: 'utf8', maxBuffer: stageCaptureMaxBuffer(env) }, (error, stdout, stderr) => {
       resolve({
         status: error ? (Number.isInteger(error.code) ? error.code : 1) : 0,
         stdout,
@@ -421,9 +512,9 @@ function defaultRunner({ cliPath, args, cwd, env }) {
   });
 }
 
-function stageArguments({ stage, type, input, output, quality, repoRoot, outDir }) {
+function stageArguments({ stage, type, input, output, quality, repoRoot, outDir, writingMode }) {
   const qualityArgs = ['--quality', quality];
-  const repoArgs = repoRoot ? ['--repo-root', repoRoot] : [];
+  const repoArgs = [...(repoRoot ? ['--repo-root', repoRoot] : []), ...(type==='explainer' && writingMode ? ['--writing',writingMode] : [])];
   if (stage === 'validate') return ['validate', type, input, ...qualityArgs, ...repoArgs, '--json'];
   if (stage === 'deliver') return ['deliver', type, input, output, ...qualityArgs, ...repoArgs, '--json'];
   if (stage === 'check') return ['check', output, '--require-provenance'];
@@ -463,9 +554,36 @@ function defaultDeliveryPaths(output) {
   };
 }
 
-function reservedFinalizePaths({ input, output, outDir, deliveryPaths }) {
+// A reverted specification must not retain the retry's current-delivery claim.
+// Preserve sidecars from other deliveries and remove only the verified inode.
+function invalidateRepairedDelivery(output, delivery, deliveryPaths) {
+  if (!delivery?.ok || !delivery.receiptId) return;
+  const file = deliveryPaths(output).provenance;
+  const captured = captureRegularFileBinding(file, {
+    subject: 'finalize-repaired-delivery', includeContent: true,
+  });
+  if (captured.reason?.systemCode === 'ENOENT') return;
+  if (captured.status !== 'captured') throw new Error('Cannot bind the repaired delivery sidecar.');
+  try {
+    const sidecar = JSON.parse(captured.content.buffer.toString('utf8'));
+    if (sidecar.receiptId !== delivery.receiptId) return;
+    const owned = sidecar.status === 'current' && sidecar.command === 'deliver'
+      && pathsAlias(sidecar.output, output)
+      && sidecar.artifact?.sha256 === delivery.artifact?.sha256
+      && sidecar.specification?.sha256 === delivery.specification?.sha256;
+    if (!owned) throw new Error('The repaired delivery sidecar changed before rollback.');
+    const removed = quarantineRemoveRegularFileBinding(captured.binding, file, {
+      subject: 'finalize-repaired-delivery', expectedLinks: 1,
+    });
+    if (removed.status !== 'removed') throw new Error('Cannot invalidate the repaired delivery sidecar.');
+  } finally {
+    releaseRegularFileBinding(captured.binding);
+  }
+}
+
+function reservedFinalizePaths({ input, output, outDir, deliveryPaths, inputPaths }) {
   const browser = browserCheckSidecarPaths(output, { outDir });
-  return [path.resolve(input), path.resolve(output), ...Object.values(deliveryPaths(output)), browser.receipt];
+  return [path.resolve(input), ...inputPaths, path.resolve(output), ...Object.values(deliveryPaths(output)), browser.receipt];
 }
 
 // Node moves that remove the measured crossings and detours, most specific
@@ -489,6 +607,9 @@ function placementHints({ crossings = [], detours = [], crowdedSides = [] }) {
   }
   return [...new Set(hints)].slice(0, 8);
 }
+
+// Route failures call for a connected-scene repair; size and text failures do not.
+const ROUTE_DIAGNOSTIC = /^(clean-flow\/|composition\/(proper-crossing|ambiguous-corridor|border-run|container-border-run|excessive-route-detour|route-rhythm|arrowhead-collision))/;
 
 export function compactFinalizeReceipt(receipt) {
   const gates = {};
@@ -518,8 +639,9 @@ export function compactFinalizeReceipt(receipt) {
       message: entry.message,
       ...(entry.subject ? { subject: entry.subject } : {}),
       ...(entry.evidence && Object.keys(entry.evidence).length ? { evidence: entry.evidence } : {}),
+      // Verified repairs may require every edit in the set to be applied together.
       ...(Array.isArray(entry.supportedFixes) && entry.supportedFixes.length
-        ? { supportedFixes: entry.supportedFixes.slice(0, 2) } : {}),
+        ? { supportedFixes: [...entry.supportedFixes] } : {}),
     });
   };
   for (const [index, entry] of allDiagnostics.entries()) {
@@ -534,6 +656,13 @@ export function compactFinalizeReceipt(receipt) {
     addDiagnostic(entry, index);
   }
   for (const [index, entry] of allDiagnostics.entries()) addDiagnostic(entry, index);
+  const truncated = allDiagnostics.length > selectedDiagnostics.length;
+  const omittedCounts = new Map();
+  if (truncated) {
+    for (const [index, entry] of allDiagnostics.entries()) {
+      omittedCounts.set(entry.code, (omittedCounts.get(entry.code) || 0) + (selectedIndexes.has(index) ? 0 : 1));
+    }
+  }
   const compact = {
     schemaVersion: 1,
     ok: receipt.ok,
@@ -545,16 +674,21 @@ export function compactFinalizeReceipt(receipt) {
     artifact: receipt.artifact,
     gates,
     ...(receipt.failedStage ? { failedStage: receipt.failedStage } : {}),
+    ...(receipt.autoRepair ? { autoRepair: receipt.autoRepair } : {}),
     diagnostics: selectedDiagnostics,
     diagnosticSummary: {
       total: allDiagnostics.length,
       shown: selectedDiagnostics.length,
-      truncated: allDiagnostics.length > selectedDiagnostics.length,
+      truncated,
+      ...(truncated ? { omittedByCode: Object.fromEntries([...omittedCounts].filter(([, count]) => count > 0)) } : {}),
     },
     evidence: receipt.evidence,
-    ...(receipt.update ? { update: receipt.update } : {}),
+    ...(receipt.update && receipt.update.status !== 'unavailable'
+      ? { update: receipt.update }
+      : {}),
     visualReview: receipt.visualReview || 'not-requested',
     durationMs: receipt.durationMs,
+    ...(receipt.browserCheck ? {browserCheck:receipt.browserCheck} : {}),
   };
   const metrics = receipt.stages?.check?.receipt?.composition?.metrics;
   const reviewSignals = Object.fromEntries([
@@ -564,6 +698,8 @@ export function compactFinalizeReceipt(receipt) {
   if (receipt.ok && Object.keys(reviewSignals).length) {
     const routeReview = receipt.stages?.check?.receipt?.composition?.routeReview;
     const hints = routeReview ? placementHints(routeReview) : [];
+    // Modes without free node placement cannot act on node-move hints.
+    const advisoryOnly = Boolean(receipt.type) && receipt.type !== 'architecture';
     compact.visualReviewRecommendation = {
       action: 'inspect-route-readability',
       signals: reviewSignals,
@@ -574,8 +710,10 @@ export function compactFinalizeReceipt(receipt) {
           detours: routeReview.detours.slice(0, 8),
           truncated: routeReview.crossings.length > 8 || routeReview.detours.length > 8,
         },
-        ...(hints.length ? { hints } : {}),
-        repair: 'Trace these relationships at the desktop viewport. For Architecture, use references/architecture-layout-repair.md: reflow a blocked main path or tangled connected scene, and repair an isolated defect locally only when the surrounding composition is accepted. Preserve all semantic content and user-fixed geometry. Rerun finalize once after the edit.',
+        ...(hints.length && !advisoryOnly ? { hints } : {}),
+        repair: !advisoryOnly
+          ? 'Trace these relationships at the desktop viewport. For Architecture, use references/architecture-layout-repair.md: reflow a blocked main path or tangled connected scene, and repair an isolated defect locally only when the surrounding composition is accepted. Preserve all semantic content and user-fixed geometry. Rerun finalize once after the edit.'
+          : 'Advisory only: this mode places or routes these relationships itself. Report them; do not remove relationships or meaning to reduce crossings.',
       } : {}),
     };
   }
@@ -594,20 +732,123 @@ export function compactFinalizeReceipt(receipt) {
       action: 'inspect-sequence-width',
       evidence: sequenceColumnSpace,
       reason: 'Fixed participant columns leave substantial unused space on the right, after accounting for message labels and notes. This is a layout suggestion, not a failed gate.',
-      repair: 'For a newly authored Sequence with omitted meta.column_fit and no user-fixed column geometry, set meta.column_fit to "spread" and rerun finalize once. Preserve participant order, every message, its y position, labels, notes and sources. Retain explicit fixed layouts and legacy inputs; report the suggestion instead of changing them automatically.',
+      repair: 'Check whether the explicit fixed column geometry is intentional. Only when changing that geometry is authorized, save the passing fixed candidate, set only meta.column_fit to "spread", and rerun the complete finalize once with --out-dir <folder>/width-review. If that attempt fails, restore the saved candidate and finalize it with --out-dir <folder>/width-restore; report the remaining suggestion instead of iterating. Preserve participant order, every message, its y position, labels, notes, sources and canvas dimensions. Retain intentional fixed layouts; report the suggestion instead of changing them automatically.',
     };
   }
   if (!receipt.ok && receipt.status === 'fail' && receipt.failedStage === 'validate') {
     compact.nextAction = {
       action: 'edit-in-place',
       candidate: receipt.specification?.path,
-      constraint: receipt.type === 'architecture'
+      constraint: receipt.type === 'architecture' && (receipt.diagnostics || []).some((entry) => ROUTE_DIAGNOSTIC.test(entry.code || ''))
         ? 'Preserve all semantics and user-fixed geometry. Use references/architecture-layout-repair.md to choose a local repair or connected-scene reflow; edit the existing candidate.'
-        : 'Preserve unaffected semantics and geometry; do not replace the whole candidate.',
+        : 'Preserve unaffected semantics and geometry; apply each diagnostic\'s supportedFixes, or the fix its message names, and do not replace the whole candidate.',
       then: 'finalize-once',
     };
   }
   return compact;
+}
+
+// Candidate repairs bind both the prior file identity and its bytes.
+// Publication uses a verified private sibling and preserves the candidate
+// mode; a failed write never leaves a partial candidate behind.
+function captureCandidate(file) {
+  const captured = captureAtomicOutput(file, { requestedEntryPolicy: 'regular-or-absent' });
+  if (captured.status !== 'captured' || captured.snapshot.target.kind === 'absent') {
+    throw new Error('The candidate cannot be captured safely.');
+  }
+  const bytes = fs.readFileSync(file);
+  if (verifyAtomicOutput(captured.snapshot).status !== 'match') throw new Error('The candidate changed during capture.');
+  return { ...captured, bytes };
+}
+
+export function replaceCandidate(file, contents, { writeFile = fs.writeFileSync, expected = captureCandidate(file) } = {}) {
+  const bytes = Buffer.isBuffer(contents) ? contents : Buffer.from(contents);
+  const staged = path.join(path.dirname(file), `.archify-candidate-${randomUUID()}.json`);
+  let binding;
+  let stagedIdentity;
+  try {
+    fs.writeFileSync(staged, Buffer.alloc(0), { flag: 'wx', mode: 0o600 });
+    const created = fs.lstatSync(staged, { bigint: true });
+    stagedIdentity = { device: created.dev, inode: created.ino };
+    writeFile(staged, bytes, { flag: 'w', mode: 0o600 });
+    const metadata = fs.lstatSync(staged, { bigint: true });
+    if (!metadata.isFile() || metadata.dev !== stagedIdentity.device || metadata.ino !== stagedIdentity.inode) {
+      throw new Error('The staged candidate changed during writing.');
+    }
+    if (expected.mode !== null) fs.chmodSync(staged, expected.mode);
+    if (!fs.readFileSync(staged).equals(bytes)) throw new Error('The staged candidate does not match the prepared bytes.');
+    const captured = captureRegularFileBinding(staged, {
+      subject: 'finalize-candidate', expectedIdentity: stagedIdentity,
+      expectedSha256: sha256(bytes), expectedBytes: bytes.byteLength,
+    });
+    if (captured.status !== 'captured') throw new Error('The staged candidate cannot be bound safely.');
+    binding = captured.binding;
+    if (!fs.readFileSync(file).equals(expected.bytes)) throw new Error('The candidate changed since repair preparation.');
+    // Prepare the next identity-bound snapshot before publication. A committed
+    // replacement must remain recoverable even if subsequent inspection fails.
+    const stagedCapture = captureCandidate(staged);
+    const next = { ...expected, bytes, snapshot: { ...expected.snapshot,
+      requestedEntry: stagedCapture.snapshot.requestedEntry, target: stagedCapture.snapshot.target } };
+    const publication = publishRegularFileBinding(binding, staged, expected.snapshot, {
+      subject: 'finalize-candidate', expectedPreviousSha256: sha256(expected.bytes), expectedPreviousBytes: expected.bytes.byteLength,
+    });
+    if (!['committed', 'committed-with-warning'].includes(publication.status)) {
+      throw new Error(`The candidate replacement failed safely (${publication.reason?.code || publication.status}).`);
+    }
+    return { ...next, publication };
+  } finally {
+    if (binding) releaseRegularFileBinding(binding);
+    if (stagedIdentity) removeOwnedRegularFile(staged, stagedIdentity, { subject: 'finalize-candidate' });
+  }
+}
+
+function pointerTarget(document, pointer) {
+  const keys = String(pointer || '').split('/').slice(1).map((key) => key.replace(/~1/g, '/').replace(/~0/g, '~'));
+  let node = document;
+  for (const key of keys) {
+    if (node === null || typeof node !== 'object' || !Object.hasOwn(node, key)) return null;
+    node = node[key];
+  }
+  return node && typeof node === 'object' ? node : null;
+}
+
+// Only an existing citation with a valid start and an end past EOF can be
+// narrowed without selecting a new start, file, or revision. Revalidate the
+// entire candidate afterward; this does not verify the cited factual claim.
+function repairSourceRanges(candidatePath, diagnostics, specification, expected) {
+  if (!diagnostics?.length || !expected) return null;
+  if (!diagnostics.every(d => d.code === 'repository-evidence/line-out-of-range'
+    && Number.isSafeInteger(d.evidence?.line) && d.evidence.line > 0
+    && Number.isSafeInteger(d.evidence?.endLine)
+    && Number.isSafeInteger(d.evidence?.lineCount) && d.evidence.lineCount >= d.evidence.line
+    && d.evidence.endLine > d.evidence.lineCount)) return null;
+  try {
+    if (verifyAtomicOutput(expected.snapshot).status !== 'match') return null;
+    const bytes = fs.readFileSync(candidatePath);
+    if (!bytes.equals(expected.bytes) || !identitiesMatch(specification,
+      { sha256: sha256(bytes), bytes: bytes.byteLength })) return null;
+    const candidate = JSON.parse(bytes.toString('utf8').replace(/^\uFEFF/, ''));
+    // Serialization must change only the end_line tokens, including preserving
+    // original number spellings and precision, whitespace, and encoding.
+    if (!bytes.equals(Buffer.from(`${JSON.stringify(candidate, null, 2)}\n`))) return null;
+    const sourceRanges = [];
+    for (const diagnostic of diagnostics) {
+      const source = pointerTarget(candidate, diagnostic.subject?.path);
+      const { line, endLine, lineCount, sourcePath } = diagnostic.evidence;
+      if (!source || source.line !== line || source.end_line !== endLine) return null;
+      // path-contract-allow: git-path -- Both values name the same repository-relative citation token.
+      if (source.path !== sourcePath) return null;
+      source.end_line = lineCount;
+      sourceRanges.push({ path: diagnostic.subject.path, endLine: [endLine, lineCount] });
+    }
+    const capture = replaceCandidate(candidatePath, `${JSON.stringify(candidate, null, 2)}\n`, { expected });
+    return { originalBytes: bytes, capture, record: {
+      originalSha256: specification.sha256, repairedSha256: sha256(capture.bytes), sourceRanges,
+      ...(capture.publication.status === 'committed-with-warning' ? { publicationWarning: capture.publication } : {}),
+    } };
+  } catch {
+    return null;
+  }
 }
 
 export async function runFinalize({
@@ -617,7 +858,10 @@ export async function runFinalize({
   output,
   quality = 'showcase',
   repoRoot,
+  writingMode,
   candidateSha256,
+  preparedExplainer,
+  browserCheck = false,
   outDir,
   receiptPath,
   deliveryPaths = defaultDeliveryPaths,
@@ -631,12 +875,18 @@ export async function runFinalize({
   createBrowser = (chromePath, options) => new ChromeVisualBrowser(chromePath, options),
 } = {}) {
   if (!cliPath || !type || !input || !output) throw new Error('finalize requires cliPath, type, input, and output.');
+  const needsBrowser = type !== 'explainer' || browserCheck;
   const started = process.hrtime.bigint();
   const startedAt = new Date().toISOString();
   const resolvedInput = path.resolve(input);
-  const resolvedOutput = resolveOutputPath({ requestedOutput: output, inputPaths: [resolvedInput] }).outputPath;
+  const inputPaths = type === 'explainer'
+    ? declaredExplainerInputPaths(fs.readFileSync(resolvedInput, 'utf8'), resolvedInput)
+    : [resolvedInput];
+  const resolvedOutput = resolveOutputPath({ requestedOutput: output, inputPaths }).outputPath;
   const resolvedOutDir = outDir === undefined ? undefined : resolveNativeOutputDirectory(outDir);
-  const specification = identity(resolvedInput);
+  let specification = identity(resolvedInput);
+  let specificationCapture;
+  try { specificationCapture = captureCandidate(resolvedInput); } catch {}
   if (candidateSha256 && specification.sha256 !== candidateSha256) {
     const error = new Error(`The candidate changed after validation: expected sha256 ${candidateSha256}, found ${specification.sha256 || 'unreadable'}.`);
     error.finalizeCode = 'finalize/candidate-changed';
@@ -648,17 +898,24 @@ export async function runFinalize({
     throw error;
   }
   // Validate raw native CLI paths before creating directories or normalizing them.
-  if (receiptPath !== undefined) resolveOutputPath({ requestedOutput: receiptPath, inputPaths: [resolvedInput], requiredExtension: '.json' });
+  if (receiptPath !== undefined) resolveOutputPath({ requestedOutput: receiptPath, inputPaths, requiredExtension: '.json' });
   fs.mkdirSync(path.dirname(canonicalFuturePath(resolvedOutput)), { recursive: true });
   const resolvedReceipt = resolveOutputPath({
     requestedOutput: receiptPath ?? defaultFinalizeReceiptPath(resolvedOutput, { outDir: resolvedOutDir }),
-    inputPaths: [resolvedInput], requiredExtension: '.json',
+    inputPaths, requiredExtension: '.json',
   }).outputPath;
   const resolvedSummary = resolveOutputPath({
-    requestedOutput: defaultFinalizeSummaryPath(resolvedReceipt), inputPaths: [resolvedInput], requiredExtension: '.json',
+    requestedOutput: defaultFinalizeSummaryPath(resolvedReceipt), inputPaths, requiredExtension: '.json',
   }).outputPath;
   const assertReceiptPaths = () => {
-    const reserved = reservedFinalizePaths({ input: resolvedInput, output: resolvedOutput, outDir: resolvedOutDir, deliveryPaths });
+    if (type === 'explainer') {
+      const publications = Object.values(deliveryPaths(resolvedOutput));
+      if (needsBrowser) publications.push(browserCheckSidecarPaths(resolvedOutput, { outDir: resolvedOutDir }).receipt);
+      for (const target of publications) {
+        resolveOutputPath({ requestedOutput: target, inputPaths, requiredExtension: '.json', inputDescription: 'an Explainer input' });
+      }
+    }
+    const reserved = reservedFinalizePaths({ input: resolvedInput, output: resolvedOutput, outDir: resolvedOutDir, deliveryPaths, inputPaths });
     const receiptCollision = reserved.find((file) => pathsAlias(resolvedReceipt, file));
     if (receiptCollision) throw new Error(`The finalize receipt must be distinct from the specification, artifact, and gate sidecars: "${receiptCollision}".`);
     const summaryCollision = [resolvedReceipt, ...reserved].find((file) => pathsAlias(resolvedSummary, file));
@@ -679,12 +936,18 @@ export async function runFinalize({
     startedAt,
     specification,
     artifact: { path: resolvedOutput },
-    stages: {},
+    stages: needsBrowser ? {} : {'browser-check':{status:'not-run',execution:'not-requested'}},
+    browserCheck: {requested:needsBrowser,ran:false},
     diagnostics: [],
     evidence: { receipt: resolvedReceipt, summaryReceipt: resolvedSummary },
     visualReview: 'not-requested',
   };
   const persistReceipts = () => {
+    if (type === 'explainer') receipt.diagnostics = (receipt.diagnostics || []).map(entry => {
+      const location=preparedExplainer?.sourceMap?.[entry.subject?.path] || {};
+      return {...entry,subject:{input:resolvedInput,line:location.line || 1,component:'document',...(entry.subject || {})},
+        evidence:{reason:entry.code,example:entry.supportedFixes?.[0] || 'Repair the named original draft component and rerun finalize.',...(entry.evidence || {})}};
+    });
     assertReceiptPaths();
     for (const [file, capture] of [[resolvedReceipt, receiptCapture], [resolvedSummary, summaryCapture]]) {
       const current = verifyAtomicOutput(capture.snapshot);
@@ -696,24 +959,14 @@ export async function runFinalize({
   persistReceipts();
   // The gates below usually take seconds, so a slower network can finish the
   // update check in parallel instead of timing out on every delivery.
-  const updateCheck = startUpdateCheck({ env, deadlineMs: FINALIZE_UPDATE_DEADLINE_MS });
+  const updateCheck = startUpdateCheck({ env, deadlineMs: needsBrowser ? FINALIZE_UPDATE_DEADLINE_MS : 200 });
 
-  // Only launch/attach the blank browser here. The normal browser gate still
-  // verifies current delivery provenance before it consumes this one-shot factory.
-  const chromePath = runBrowserCheck ? resolveChrome({ env }) : null;
+  // Resolve and launch Chrome only after delivery and strict artifact checks pass.
+  // Invalid candidates must not start a browser that cannot inspect an artifact.
+  let chromePath = null;
   let browser;
   let browserStartupError;
   let browserTransferred = false;
-  if (chromePath) {
-    try {
-      browser = createBrowser(chromePath, { env });
-      // Deliver/check may fail before inspect() awaits startup. Handle the
-      // rejection now while retaining the same promise for the browser gate.
-      browser.sessionPromise.catch(() => {});
-    } catch (error) {
-      browserStartupError = error;
-    }
-  }
   const browserFactory = () => {
     if (browserStartupError) throw browserStartupError;
     if (browserTransferred || !browser) throw new Error('The finalize browser is unavailable or already consumed.');
@@ -721,132 +974,221 @@ export async function runFinalize({
     return browser;
   };
 
+  let repair;
+  const restoreRepair = () => {
+    if (!repair || receipt.autoRepair?.outcome === 'reverted' || receipt.autoRepair?.outcome === 'restore-failed') return;
+    try {
+      invalidateRepairedDelivery(resolvedOutput, receipt.stages.deliver?.receipt, deliveryPaths);
+      const restored = replaceCandidate(resolvedInput, repair.originalBytes, { expected: repair.capture });
+      receipt.autoRepair = { ...repair.record, outcome: 'reverted',
+        ...(restored.publication.status === 'committed-with-warning' ? { restoreWarning: restored.publication } : {}) };
+    } catch (error) {
+      receipt.autoRepair = { ...repair.record, outcome: 'restore-failed', reason: error.message };
+    }
+  };
   try {
     let exitCode = 0;
-    for (const stage of ['deliver', 'check', 'browser-check']) {
-      const stageStarted = process.hrtime.bigint();
-      const args = stageArguments({
-        stage,
-        type,
-        input: resolvedInput,
-        output: resolvedOutput,
-        quality,
-        repoRoot,
-        outDir: resolvedOutDir,
-      });
-      const inProcess = stage === 'browser-check' && runBrowserCheck;
-      let result;
-      if (inProcess) {
-        const checked = await runBrowserCheck({
-          artifactPath: resolvedOutput,
-          outDir: resolvedOutDir,
-          chromePath,
-          resolveChrome: () => chromePath,
-          browserFactory,
-        });
-        result = { status: checked.exitCode, stdout: JSON.stringify(checked.receipt) };
-      } else {
-        result = await runCommand({ stage, cliPath, args, cwd,
-          env: stage === 'deliver' ? { ...env, ARCHIFY_UPDATE_CHECK_DISABLED: '1' } : env });
-      }
-      const stageReceipt = parsedReceipt(result.stdout);
-      const code = result.status ?? 1;
-      let status = stageStatus(stage, code, stageReceipt, quality);
-      let stageDiagnostics;
-      const command = [process.execPath, cliPath, ...args];
-      const elapsed = durationMs(stageStarted);
-      if (status === 'pass') {
-        const deliveryReceipt = stage === 'deliver' ? stageReceipt : receipt.stages.deliver?.receipt;
-        const bindingDiagnostic = stageBindingDiagnostic({
+    for (let attempt = 0; attempt < 2; attempt++) {
+      for (const stage of (needsBrowser ? ['deliver', 'check', 'browser-check'] : ['deliver','check'])) {
+        const stageStarted = process.hrtime.bigint();
+        const args = stageArguments({
           stage,
-          receipt: stageReceipt,
-          expectedArtifact: deliveryReceipt?.artifact,
-          expectedReceiptId: deliveryReceipt?.receiptId,
-          output: resolvedOutput,
-          specification,
           type,
-          deliveryValidation: deliveryReceipt?.validation,
+          input: resolvedInput,
+          output: resolvedOutput,
+          quality,
+          repoRoot,
+          writingMode,
+          outDir: resolvedOutDir,
         });
-        if (bindingDiagnostic) stageDiagnostics = [bindingDiagnostic];
-      } else if (stage === 'deliver' && code === 0 && quality === 'showcase'
-          && Number.isSafeInteger(stageReceipt?.validation?.warnings)
-          && stageReceipt.validation.warnings > 0
-          && validStageReceipt(stage, stageReceipt, quality, { allowShowcaseWarnings: true })) {
-        const bindingDiagnostic = stageBindingDiagnostic({
-          stage, receipt: stageReceipt, output: resolvedOutput, specification, type,
-        });
-        stageDiagnostics = bindingDiagnostic ? [bindingDiagnostic] : showcaseWarningDiagnostics(stageReceipt);
-      }
-      if (stageDiagnostics) {
-        status = 'fail';
-      }
-      const stageEntry = {
-        status,
-        exitCode: code,
-        durationMs: elapsed,
-        command,
-        ...(inProcess ? { execution: 'in-process' } : {}),
-        ...(stageReceipt ? { receipt: stageReceipt } : {}),
-        ...(!stageReceipt && String(result.stdout || '').trim() ? { stdout: String(result.stdout).trim() } : {}),
-        ...(String(result.stderr || '').trim() ? { stderr: String(result.stderr).trim() } : {}),
-        ...(result.signal ? { signal: result.signal } : {}),
-      };
-
-      if (stage === 'deliver' && status === 'pass') {
-        receipt.stages.validate = {
-          status: 'pass',
-          exitCode: 0,
-          durationMs: null,
-          execution: 'embedded-in-deliver',
+        const inProcess = stage === 'browser-check' && runBrowserCheck;
+        let result;
+        if (preparedExplainer) {
+          try {
+            const { assertPreparedDependencies } = await import('../explainer/prepare.mjs');
+            assertPreparedDependencies(preparedExplainer);
+          } catch (error) {
+            result = { status: 1, stdout: JSON.stringify({ok:false,status:'fail',command:stage,stage:'prepare',diagnostics:error.archifyDiagnostics || []}) };
+          }
+        }
+        if (result) {
+          // The original resources changed between gates; do not run another gate on them.
+        } else if (inProcess) {
+          try {
+            chromePath = resolveChrome({ env });
+            if (chromePath) {
+              browser = createBrowser(chromePath, { env });
+              // Retain the startup rejection for the browser gate without emitting
+              // an unhandled rejection before inspect() awaits the same promise.
+              browser.sessionPromise.catch(() => {});
+            }
+          } catch (error) {
+            browserStartupError = error;
+          }
+          // Discovery errors have no executable for the browser factory. Record
+          // a failed gate instead of treating them as ordinary Chrome absence.
+          const checked = browserStartupError && !chromePath
+            ? { exitCode: 1, receipt: persistBrowserCheckFailure(resolvedOutput, {
+              schemaVersion: 1, ok: false, command: 'browser-check', status: 'fail',
+              evidenceKind: 'automated-browser', visualReview: 'not-requested',
+              error: browserStartupError.message,
+              diagnostics: [{
+                code: 'viewer/browser-check-runtime', severity: 'error',
+                message: 'browser-check could not discover Chrome.',
+                subject: { artifact: resolvedOutput },
+                evidence: { reason: browserStartupError.message },
+                supportedFixes: ['resolve the reported Chrome discovery error, then rerun browser-check'],
+              }],
+            }, { outDir: resolvedOutDir }) }
+            : await runBrowserCheck({
+              artifactPath: resolvedOutput,
+              outDir: resolvedOutDir,
+              chromePath,
+              resolveChrome: () => chromePath,
+              browserFactory,
+            });
+          result = { status: checked.exitCode, stdout: JSON.stringify(checked.receipt) };
+        } else {
+          result = await runCommand({ stage, cliPath, args, cwd,
+            env: stage === 'deliver' ? { ...env, ARCHIFY_UPDATE_CHECK_DISABLED: '1' } : env });
+        }
+        if (preparedExplainer && result.status === 0) {
+          try {
+            const { assertPreparedDependencies } = await import('../explainer/prepare.mjs');
+            assertPreparedDependencies(preparedExplainer);
+          } catch (error) {
+            result = { status: 1, stdout: JSON.stringify({ok:false,status:'fail',command:stage,stage:'prepare',diagnostics:error.archifyDiagnostics || []}) };
+          }
+        }
+        const stageReceipt = parsedReceipt(result.stdout);
+        if (stage === 'browser-check') receipt.browserCheck.ran = Boolean(stageReceipt?.containment?.viewports?.length);
+        const code = result.status ?? 1;
+        let status = stageStatus(stage, code, stageReceipt, quality);
+        let stageDiagnostics;
+        const command = [process.execPath, cliPath, ...args];
+        const elapsed = durationMs(stageStarted);
+        if (status === 'pass') {
+          const deliveryReceipt = stage === 'deliver' ? stageReceipt : receipt.stages.deliver?.receipt;
+          const bindingDiagnostic = stageBindingDiagnostic({
+            stage,
+            receipt: stageReceipt,
+            expectedArtifact: deliveryReceipt?.artifact,
+            expectedReceiptId: deliveryReceipt?.receiptId,
+            output: resolvedOutput,
+            specification,
+            type,
+            deliveryValidation: deliveryReceipt?.validation,
+          });
+          if (bindingDiagnostic) stageDiagnostics = [bindingDiagnostic];
+        } else if (stage === 'deliver' && code === 0 && quality === 'showcase'
+            && Number.isSafeInteger(stageReceipt?.validation?.warnings)
+            && stageReceipt.validation.warnings > 0
+            && validStageReceipt(stage, stageReceipt, quality, { allowShowcaseWarnings: true })) {
+          const bindingDiagnostic = stageBindingDiagnostic({
+            stage, receipt: stageReceipt, output: resolvedOutput, specification, type,
+          });
+          stageDiagnostics = bindingDiagnostic ? [bindingDiagnostic] : showcaseWarningDiagnostics(stageReceipt);
+        }
+        if (stageDiagnostics) {
+          status = 'fail';
+        }
+        const stageEntry = {
+          status,
+          exitCode: code,
+          durationMs: elapsed,
           command,
-          receipt: {
-            schemaVersion: 1,
-            ok: true,
-            command: 'validate',
-            specification: stageReceipt.specification,
-            validation: stageReceipt.validation,
-          },
+          ...(inProcess ? { execution: 'in-process' } : {}),
+          ...(stageReceipt ? { receipt: stageReceipt } : {}),
+          ...(!stageReceipt && String(result.stdout || '').trim() ? { stdout: String(result.stdout).trim() } : {}),
+          ...(String(result.stderr || '').trim() ? { stderr: String(result.stderr).trim() } : {}),
+          ...(result.signal ? { signal: result.signal } : {}),
         };
-        receipt.stages.deliver = stageEntry;
-      } else if (stage === 'deliver') {
-        const validationFailed = stageDiagnostics?.some((diagnostic) => diagnostic.code === 'finalize/candidate-changed-during-delivery')
-          || ['input', 'render', 'check'].includes(stageReceipt?.stage);
-        receipt.stages.validate = validationFailed ? {
-          ...stageEntry,
-          status: 'fail',
-          durationMs: null,
-          execution: 'embedded-in-deliver',
-        } : { status: 'not-run', execution: 'embedded-in-deliver' };
-        receipt.stages.deliver = validationFailed
-          ? { status: 'not-run', execution: 'blocked-by-validate' }
-          : stageEntry;
-      } else {
-        receipt.stages[stage] = stageEntry;
-      }
 
-      if (stage === 'deliver' && stageReceipt?.artifact) receipt.artifact = {
-        path: resolvedOutput,
-        ...stageReceipt.artifact,
-      };
-      if (stage === 'browser-check') {
-        receipt.evidence = {
-          receipt: resolvedReceipt,
-          summaryReceipt: resolvedSummary,
-          ...browserEvidence(stageReceipt, resolvedOutput),
+        if (stage === 'deliver' && status === 'pass') {
+          // Non-blocking warnings (for example locale fallbacks) stay visible in
+          // a passing receipt; a later failing gate replaces them.
+          receipt.diagnostics = (stageReceipt.diagnostics || []).filter((entry) => entry?.severity === 'warning');
+          receipt.stages.validate = {
+            status: 'pass',
+            exitCode: 0,
+            durationMs: null,
+            execution: 'embedded-in-deliver',
+            command,
+            receipt: {
+              schemaVersion: 1,
+              ok: true,
+              command: 'validate',
+              specification: stageReceipt.specification,
+              validation: stageReceipt.validation,
+            },
+          };
+          receipt.stages.deliver = stageEntry;
+        } else if (stage === 'deliver') {
+          const validationFailed = stageDiagnostics?.some((diagnostic) => diagnostic.code === 'finalize/candidate-changed-during-delivery')
+            || ['input', 'render', 'check'].includes(stageReceipt?.stage);
+          receipt.stages.validate = validationFailed ? {
+            ...stageEntry,
+            status: 'fail',
+            durationMs: null,
+            execution: 'embedded-in-deliver',
+          } : { status: 'not-run', execution: 'embedded-in-deliver' };
+          receipt.stages.deliver = validationFailed
+            ? { status: 'not-run', execution: 'blocked-by-validate' }
+            : stageEntry;
+        } else {
+          receipt.stages[stage] = stageEntry;
+        }
+
+        if (stage === 'deliver' && stageReceipt?.artifact) receipt.artifact = {
+          path: resolvedOutput,
+          ...stageReceipt.artifact,
         };
-      }
+        if (stage === 'browser-check') {
+          receipt.evidence = {
+            receipt: resolvedReceipt,
+            summaryReceipt: resolvedSummary,
+            ...browserEvidence(stageReceipt, resolvedOutput),
+          };
+        }
 
-      if (status !== 'pass') {
-        exitCode = status === 'skipped' ? 2 : (code || 1);
-        receipt.status = status;
-        receipt.diagnostics = stageDiagnostics || failureDiagnostics(stage, result, stageReceipt, quality);
-        receipt.failedStage = stage === 'deliver'
-          && receipt.stages.validate.status === 'fail' ? 'validate' : stage;
-        break;
+        if (status !== 'pass') {
+          exitCode = status === 'skipped' ? 2 : (code || 1);
+          receipt.status = status;
+          receipt.diagnostics = consolidateDiagnostics(
+            stageDiagnostics || failureDiagnostics(stage, result, stageReceipt, quality),
+          );
+          receipt.failedStage = stage === 'deliver'
+            && receipt.stages.validate.status === 'fail' ? 'validate' : stage;
+          break;
+        }
+        persistReceipts();
       }
-      persistReceipts();
+      if (attempt === 0 && exitCode !== 0 && receipt.failedStage === 'validate') {
+        repair = repairSourceRanges(resolvedInput, receipt.diagnostics, specification, specificationCapture);
+        if (repair) {
+          specification = { path: resolvedInput, sha256: sha256(repair.capture.bytes), bytes: repair.capture.bytes.byteLength };
+          Object.assign(receipt, { status: 'running', specification, stages: needsBrowser ? {} : {
+            'browser-check': { status: 'not-run', execution: 'not-requested' } },
+            diagnostics: [], artifact: { path: resolvedOutput }, autoRepair: { ...repair.record, outcome: 'retrying' } });
+          delete receipt.failedStage;
+          exitCode = 0;
+          if (repair.record.publicationWarning) {
+            const error = new Error('The repaired candidate was published with a cleanup warning; finalize will restore it.');
+            error.finalizeCode = 'finalize/candidate-publication';
+            throw error;
+          }
+          persistReceipts();
+          continue;
+        }
+      }
+      break;
     }
 
+    // Finish owned browser cleanup before a successful receipt can be published.
+    if (browser && !browserTransferred) {
+      await browser.close();
+      browser = null;
+    }
     receipt.ok = exitCode === 0;
     receipt.status = receipt.ok ? 'pass' : receipt.status === 'running' ? 'fail' : receipt.status;
     if (receipt.ok) {
@@ -880,6 +1222,10 @@ export async function runFinalize({
         supportedFixes: ['restore the frozen candidate, or finalize the edited candidate as a new attempt'],
       }];
     }
+    if (repair) {
+      if (receipt.ok) receipt.autoRepair = { ...repair.record, outcome: 'applied' };
+      else restoreRepair();
+    }
     receipt.artifact = receipt.ok
       ? { path: resolvedOutput, ...receipt.stages.deliver.receipt.artifact }
       : identity(resolvedOutput);
@@ -888,6 +1234,10 @@ export async function runFinalize({
     receipt.update = await updateCheck;
     persistReceipts();
     return { exitCode, receipt, summary: compactFinalizeReceipt(receipt) };
+  } catch (error) {
+    restoreRepair();
+    if (repair) error.finalizeEvidence = { ...error.finalizeEvidence, autoRepair: receipt.autoRepair };
+    throw error;
   } finally {
     if (browser && !browserTransferred) await browser.close();
     await updateCheck;

@@ -4,6 +4,11 @@ export const DIAGRAM_TYPES = Object.freeze([
   'sequence',
   'dataflow',
   'lifecycle',
+  'erd',
+  'class',
+  'tree',
+  'timeline',
+  'waterfall',
 ]);
 
 export const DIAGRAM_TYPE_LABELS = Object.freeze({
@@ -13,6 +18,11 @@ export const DIAGRAM_TYPE_LABELS = Object.freeze({
     sequence: 'Sequence',
     dataflow: 'Data flow',
     lifecycle: 'Lifecycle',
+    erd: 'Entity-relationship',
+    class: 'Class',
+    tree: 'Tree',
+    timeline: 'Timeline',
+    waterfall: 'Waterfall',
   }),
   zh: Object.freeze({
     architecture: '架构图',
@@ -20,6 +30,11 @@ export const DIAGRAM_TYPE_LABELS = Object.freeze({
     sequence: '时序图',
     dataflow: '数据流',
     lifecycle: '生命周期',
+    erd: '实体关系图',
+    class: '类图',
+    tree: '树图',
+    timeline: '时间线',
+    waterfall: '瀑布图',
   }),
 });
 
